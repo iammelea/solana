@@ -49,7 +49,7 @@ else
   # ~/.cargo
   ARGS+=(--volume "$PWD:/home")
 fi
-ARGS+=(--env "CARGO_HOME=/home/.cargo")
+ARGS+=(--env "HOME=/home" --env "CARGO_HOME=/home/.cargo")
 
 # kcov tries to set the personality of the binary which docker
 # doesn't allow by default.
@@ -60,6 +60,12 @@ if [[ -z "$SOLANA_DOCKER_RUN_NOSETUID" ]]; then
   ARGS+=(--user "$(id -u):$(id -g)")
 fi
 
+if [[ -n $SOLANA_ALLOCATE_TTY ]]; then
+  # Colored output, progress bar and Ctrl-C:
+  # https://stackoverflow.com/a/41099052/10242004
+  ARGS+=(--interactive --tty)
+fi
+
 # Environment variables to propagate into the container
 ARGS+=(
   --env BUILDKITE
@@ -67,14 +73,22 @@ ARGS+=(
   --env BUILDKITE_JOB_ID
   --env CI
   --env CI_BRANCH
+  --env CI_BASE_BRANCH
+  --env CI_TAG
   --env CI_BUILD_ID
   --env CI_COMMIT
   --env CI_JOB_ID
   --env CI_PULL_REQUEST
   --env CI_REPO_SLUG
-  --env CODECOV_TOKEN
   --env CRATES_IO_TOKEN
 )
+
+# Also propagate environment variables needed for codecov
+# https://docs.codecov.io/docs/testing-with-docker#section-codecov-inside-docker
+# We normalize CI to `1`; but codecov expects it to be `true` to detect Buildkite...
+# Unfortunately, codecov.io fails sometimes:
+#   curl: (7) Failed to connect to codecov.io port 443: Connection timed out
+CODECOV_ENVS=$(CI=true bash <(while ! curl -sS --retry 5 --retry-delay 2 --retry-connrefused https://codecov.io/env; do sleep 10; done))
 
 if $INTERACTIVE; then
   if [[ -n $1 ]]; then
@@ -83,8 +97,10 @@ if $INTERACTIVE; then
     echo
   fi
   set -x
-  exec docker run --interactive --tty "${ARGS[@]}" "$IMAGE" bash
+  # shellcheck disable=SC2086
+  exec docker run --interactive --tty "${ARGS[@]}" $CODECOV_ENVS "$IMAGE" bash
 fi
 
 set -x
-exec docker run "${ARGS[@]}" "$IMAGE" "$@"
+# shellcheck disable=SC2086
+exec docker run "${ARGS[@]}" $CODECOV_ENVS "$IMAGE" "$@"

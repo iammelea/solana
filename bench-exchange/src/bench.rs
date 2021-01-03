@@ -5,33 +5,39 @@ use itertools::izip;
 use log::*;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
-use solana::gen_keys::GenKeys;
 use solana_client::perf_utils::{sample_txs, SampleStats};
-use solana_drone::drone::request_airdrop_transaction;
-use solana_exchange_api::exchange_instruction;
-use solana_exchange_api::exchange_state::*;
-use solana_exchange_api::id;
+use solana_core::gen_keys::GenKeys;
+use solana_exchange_program::{exchange_instruction, exchange_state::*, id};
+use solana_faucet::faucet::request_airdrop_transaction;
+use solana_genesis::Base64Account;
 use solana_metrics::datapoint_info;
-use solana_sdk::client::Client;
-use solana_sdk::client::SyncClient;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::system_instruction;
-use solana_sdk::timing::{duration_as_ms, duration_as_s};
-use solana_sdk::transaction::Transaction;
-use std::cmp;
-use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::prelude::*;
-use std::mem;
-use std::net::SocketAddr;
-use std::path::Path;
-use std::process::exit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, RwLock};
-use std::thread::{sleep, Builder};
-use std::time::{Duration, Instant};
+use solana_sdk::{
+    client::{Client, SyncClient},
+    commitment_config::CommitmentConfig,
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    timing::{duration_as_ms, duration_as_s},
+    transaction::Transaction,
+    {system_instruction, system_program},
+};
+use std::{
+    cmp,
+    collections::{HashMap, VecDeque},
+    fs::File,
+    io::prelude::*,
+    mem,
+    net::SocketAddr,
+    path::Path,
+    process::exit,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{channel, Receiver, Sender},
+        Arc, RwLock,
+    },
+    thread::{sleep, Builder},
+    time::{Duration, Instant},
+};
 
 // TODO Chunk length as specified results in a bunch of failures, divide by 10 helps...
 // Assume 4MB network buffers, and 512 byte packets
@@ -88,7 +94,12 @@ pub fn create_client_accounts_file(
     keypairs.iter().for_each(|keypair| {
         accounts.insert(
             serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap(),
-            fund_amount,
+            Base64Account {
+                balance: fund_amount,
+                executable: false,
+                owner: system_program::id().to_string(),
+                data: String::new(),
+            },
         );
     });
 
@@ -134,7 +145,7 @@ where
         let path = Path::new(&client_ids_and_stake_file);
         let file = File::open(path).unwrap();
 
-        let accounts: HashMap<String, u64> = serde_yaml::from_reader(file).unwrap();
+        let accounts: HashMap<String, Base64Account> = serde_yaml::from_reader(file).unwrap();
         accounts
             .into_iter()
             .map(|(keypair, _)| {
@@ -168,19 +179,22 @@ where
 
     info!("Generating {:?} account keys", total_keys);
     let mut account_keypairs = generate_keypairs(total_keys);
-    let src_pubkeys: Vec<_> = account_keypairs
-        .drain(0..accounts_in_groups)
+    let src_keypairs: Vec<_> = account_keypairs.drain(0..accounts_in_groups).collect();
+    let src_pubkeys: Vec<Pubkey> = src_keypairs
+        .iter()
         .map(|keypair| keypair.pubkey())
         .collect();
-    let profit_pubkeys: Vec<_> = account_keypairs
-        .drain(0..accounts_in_groups)
+
+    let profit_keypairs: Vec<_> = account_keypairs.drain(0..accounts_in_groups).collect();
+    let profit_pubkeys: Vec<Pubkey> = profit_keypairs
+        .iter()
         .map(|keypair| keypair.pubkey())
         .collect();
 
     info!("Create {:?} source token accounts", src_pubkeys.len());
-    create_token_accounts(client, &trader_signers, &src_pubkeys);
+    create_token_accounts(client, &trader_signers, &src_keypairs);
     info!("Create {:?} profit token accounts", profit_pubkeys.len());
-    create_token_accounts(client, &swapper_signers, &profit_pubkeys);
+    create_token_accounts(client, &swapper_signers, &profit_keypairs);
 
     // Collect the max transaction rate and total tx count seen (single node only)
     let sample_stats = Arc::new(RwLock::new(Vec::new()));
@@ -237,7 +251,7 @@ where
     trace!("Start trader thread");
     let trader_thread = {
         let exit_signal = exit_signal.clone();
-        let shared_txs = shared_txs.clone();
+
         let client = clients[0].clone();
         Builder::new()
             .name("solana-exchange-trader".to_string())
@@ -332,7 +346,7 @@ fn do_tx_transfers<T>(
 
 struct TradeInfo {
     trade_account: Pubkey,
-    order_info: TradeOrderInfo,
+    order_info: OrderInfo,
 }
 #[allow(clippy::too_many_arguments)]
 fn swapper<T>(
@@ -374,7 +388,10 @@ fn swapper<T>(
             let mut tries = 0;
             let mut trade_index = 0;
             while client
-                .get_balance(&trade_infos[trade_index].trade_account)
+                .get_balance_with_commitment(
+                    &trade_infos[trade_index].trade_account,
+                    CommitmentConfig::recent(),
+                )
                 .unwrap_or(0)
                 == 0
             {
@@ -427,24 +444,22 @@ fn swapper<T>(
             }
             account_group = (account_group + 1) % account_groups as usize;
 
-            let (blockhash, _fee_calculator) = client
-                .get_recent_blockhash()
+            let (blockhash, _fee_calculator, _last_valid_slot) = client
+                .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
                 .expect("Failed to get blockhash");
             let to_swap_txs: Vec<_> = to_swap
                 .par_iter()
                 .map(|(signer, swap, profit)| {
                     let s: &Keypair = &signer;
                     let owner = &signer.pubkey();
-                    Transaction::new_signed_instructions(
-                        &[s],
-                        vec![exchange_instruction::swap_request(
-                            owner,
-                            &swap.0.pubkey,
-                            &swap.1.pubkey,
-                            &profit,
-                        )],
-                        blockhash,
-                    )
+                    let instruction = exchange_instruction::swap_request(
+                        owner,
+                        &swap.0.pubkey,
+                        &swap.1.pubkey,
+                        &profit,
+                    );
+                    let message = Message::new(&[instruction], Some(&s.pubkey()));
+                    Transaction::new(&[s], message, blockhash)
                 })
                 .collect();
 
@@ -509,7 +524,7 @@ fn trader<T>(
     T: Client,
 {
     // TODO Hard coded for now
-    let pair = TokenPair::AB;
+    let pair = AssetPair::default();
     let tokens = 1;
     let price = 1000;
     let mut account_group: usize = 0;
@@ -527,21 +542,21 @@ fn trader<T>(
         let mut trade_infos = vec![];
         let start = account_group * batch_size as usize;
         let end = account_group * batch_size as usize + batch_size as usize;
-        let mut direction = Direction::To;
+        let mut side = OrderSide::Ask;
         for (signer, trade, src) in izip!(
             signers[start..end].iter(),
             trade_keys,
             srcs[start..end].iter(),
         ) {
-            direction = if direction == Direction::To {
-                Direction::From
+            side = if side == OrderSide::Ask {
+                OrderSide::Bid
             } else {
-                Direction::To
+                OrderSide::Ask
             };
-            let order_info = TradeOrderInfo {
+            let order_info = OrderInfo {
                 /// Owner of the trade order
                 owner: Pubkey::default(), // don't care
-                direction,
+                side,
                 pair,
                 tokens,
                 price,
@@ -551,31 +566,41 @@ fn trader<T>(
                 trade_account: trade.pubkey(),
                 order_info,
             });
-            trades.push((signer, trade.pubkey(), direction, src));
+            trades.push((signer, trade, side, src));
         }
         account_group = (account_group + 1) % account_groups as usize;
 
-        let (blockhash, _fee_calculator) = client
-            .get_recent_blockhash()
+        let (blockhash, _fee_calculator, _last_valid_slot) = client
+            .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
             .expect("Failed to get blockhash");
 
         trades.chunks(chunk_size).for_each(|chunk| {
             let trades_txs: Vec<_> = chunk
                 .par_iter()
-                .map(|(signer, trade, direction, src)| {
-                    let s: &Keypair = &signer;
-                    let owner = &signer.pubkey();
+                .map(|(owner, trade, side, src)| {
+                    let owner_pubkey = &owner.pubkey();
+                    let trade_pubkey = &trade.pubkey();
                     let space = mem::size_of::<ExchangeState>() as u64;
-                    Transaction::new_signed_instructions(
-                        &[s],
-                        vec![
-                            system_instruction::create_account(owner, trade, 1, space, &id()),
-                            exchange_instruction::trade_request(
-                                owner, trade, *direction, pair, tokens, price, src,
-                            ),
-                        ],
-                        blockhash,
-                    )
+                    let instructions = [
+                        system_instruction::create_account(
+                            owner_pubkey,
+                            trade_pubkey,
+                            1,
+                            space,
+                            &id(),
+                        ),
+                        exchange_instruction::trade_request(
+                            owner_pubkey,
+                            trade_pubkey,
+                            *side,
+                            pair,
+                            tokens,
+                            price,
+                            src,
+                        ),
+                    ];
+                    let message = Message::new(&instructions, Some(&owner_pubkey));
+                    Transaction::new(&[owner.as_ref(), trade], message, blockhash)
                 })
                 .collect();
 
@@ -627,12 +652,14 @@ fn trader<T>(
     }
 }
 
-fn verify_transfer<T>(sync_client: &T, tx: &Transaction) -> bool
+fn verify_transaction<T>(sync_client: &T, tx: &Transaction) -> bool
 where
     T: SyncClient + ?Sized,
 {
     for s in &tx.signatures {
-        if let Ok(Some(r)) = sync_client.get_signature_status(s) {
+        if let Ok(Some(r)) =
+            sync_client.get_signature_status_with_commitment(s, CommitmentConfig::recent())
+        {
             match r {
                 Ok(_) => {
                     return true;
@@ -646,7 +673,26 @@ where
     false
 }
 
-pub fn fund_keys(client: &Client, source: &Keypair, dests: &[Arc<Keypair>], lamports: u64) {
+fn verify_funding_transfer<T: SyncClient + ?Sized>(
+    client: &T,
+    tx: &Transaction,
+    amount: u64,
+) -> bool {
+    if verify_transaction(client, tx) {
+        for a in &tx.message().account_keys[1..] {
+            if client
+                .get_balance_with_commitment(a, CommitmentConfig::recent())
+                .unwrap_or(0)
+                >= amount
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn fund_keys<T: Client>(client: &T, source: &Keypair, dests: &[Arc<Keypair>], lamports: u64) {
     let total = lamports * (dests.len() as u64 + 1);
     let mut funded: Vec<(&Keypair, u64)> = vec![(source, total)];
     let mut notfunded: Vec<&Arc<Keypair>> = dests.iter().collect();
@@ -692,21 +738,19 @@ pub fn fund_keys(client: &Client, source: &Keypair, dests: &[Arc<Keypair>], lamp
             let mut to_fund_txs: Vec<_> = chunk
                 .par_iter()
                 .map(|(k, m)| {
-                    (
-                        k.clone(),
-                        Transaction::new_unsigned_instructions(system_instruction::transfer_many(
-                            &k.pubkey(),
-                            &m,
-                        )),
-                    )
+                    let instructions = system_instruction::transfer_many(&k.pubkey(), &m);
+                    let message = Message::new(&instructions, Some(&k.pubkey()));
+                    (k.clone(), Transaction::new_unsigned(message))
                 })
                 .collect();
 
             let mut retries = 0;
+            let amount = chunk[0].1[0].1;
             while !to_fund_txs.is_empty() {
-                let receivers = to_fund_txs
+                let receivers: usize = to_fund_txs
                     .iter()
-                    .fold(0, |len, (_, tx)| len + tx.message().instructions.len());
+                    .map(|(_, tx)| tx.message().instructions.len())
+                    .sum();
 
                 debug!(
                     "  {} to {} in {} txs",
@@ -719,8 +763,9 @@ pub fn fund_keys(client: &Client, source: &Keypair, dests: &[Arc<Keypair>], lamp
                     to_fund_txs.len(),
                 );
 
-                let (blockhash, _fee_calculator) =
-                    client.get_recent_blockhash().expect("blockhash");
+                let (blockhash, _fee_calculator, _last_valid_slot) = client
+                    .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
+                    .expect("blockhash");
                 to_fund_txs.par_iter_mut().for_each(|(k, tx)| {
                     tx.sign(&[*k], blockhash);
                 });
@@ -731,7 +776,7 @@ pub fn fund_keys(client: &Client, source: &Keypair, dests: &[Arc<Keypair>], lamp
                 let mut waits = 0;
                 loop {
                     sleep(Duration::from_millis(200));
-                    to_fund_txs.retain(|(_, tx)| !verify_transfer(client, &tx));
+                    to_fund_txs.retain(|(_, tx)| !verify_funding_transfer(client, &tx, amount));
                     if to_fund_txs.is_empty() {
                         break;
                     }
@@ -749,7 +794,7 @@ pub fn fund_keys(client: &Client, source: &Keypair, dests: &[Arc<Keypair>], lamp
                     retries += 1;
                     debug!("  Retry {:?}", retries);
                     if retries >= 10 {
-                        error!("  Too many retries, give up");
+                        error!("fund_keys: Too many retries ({}), give up", retries);
                         exit(1);
                     }
                 }
@@ -757,35 +802,51 @@ pub fn fund_keys(client: &Client, source: &Keypair, dests: &[Arc<Keypair>], lamp
         });
         funded.append(&mut new_funded);
         funded.retain(|(k, b)| {
-            client.get_balance(&k.pubkey()).unwrap_or(0) > lamports && *b > lamports
+            client
+                .get_balance_with_commitment(&k.pubkey(), CommitmentConfig::recent())
+                .unwrap_or(0)
+                > lamports
+                && *b > lamports
         });
         debug!("  Funded: {} left: {}", funded.len(), notfunded.len());
     }
 }
 
-pub fn create_token_accounts(client: &Client, signers: &[Arc<Keypair>], accounts: &[Pubkey]) {
-    let mut notfunded: Vec<(&Arc<Keypair>, &Pubkey)> = signers.iter().zip(accounts).collect();
+pub fn create_token_accounts<T: Client>(
+    client: &T,
+    signers: &[Arc<Keypair>],
+    accounts: &[Keypair],
+) {
+    let mut notfunded: Vec<(&Arc<Keypair>, &Keypair)> = signers.iter().zip(accounts).collect();
 
     while !notfunded.is_empty() {
         notfunded.chunks(FUND_CHUNK_LEN).for_each(|chunk| {
             let mut to_create_txs: Vec<_> = chunk
                 .par_iter()
-                .map(|(signer, new)| {
-                    let owner_pubkey = &signer.pubkey();
+                .map(|(from_keypair, new_keypair)| {
+                    let owner_pubkey = &from_keypair.pubkey();
                     let space = mem::size_of::<ExchangeState>() as u64;
-                    let create_ix =
-                        system_instruction::create_account(owner_pubkey, new, 1, space, &id());
-                    let request_ix = exchange_instruction::account_request(owner_pubkey, new);
+                    let create_ix = system_instruction::create_account(
+                        owner_pubkey,
+                        &new_keypair.pubkey(),
+                        1,
+                        space,
+                        &id(),
+                    );
+                    let request_ix =
+                        exchange_instruction::account_request(owner_pubkey, &new_keypair.pubkey());
+                    let message = Message::new(&[create_ix, request_ix], Some(&owner_pubkey));
                     (
-                        signer,
-                        Transaction::new_unsigned_instructions(vec![create_ix, request_ix]),
+                        (from_keypair, new_keypair),
+                        Transaction::new_unsigned(message),
                     )
                 })
                 .collect();
 
-            let accounts = to_create_txs
+            let accounts: usize = to_create_txs
                 .iter()
-                .fold(0, |len, (_, tx)| len + tx.message().instructions.len() / 2);
+                .map(|(_, tx)| tx.message().instructions.len() / 2)
+                .sum();
 
             debug!(
                 "  Creating {} accounts in {} txs",
@@ -795,13 +856,14 @@ pub fn create_token_accounts(client: &Client, signers: &[Arc<Keypair>], accounts
 
             let mut retries = 0;
             while !to_create_txs.is_empty() {
-                let (blockhash, _fee_calculator) = client
-                    .get_recent_blockhash()
+                let (blockhash, _fee_calculator, _last_valid_slot) = client
+                    .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
                     .expect("Failed to get blockhash");
-                to_create_txs.par_iter_mut().for_each(|(k, tx)| {
-                    let kp: &Keypair = k;
-                    tx.sign(&[kp], blockhash);
-                });
+                to_create_txs
+                    .par_iter_mut()
+                    .for_each(|((from_keypair, to_keypair), tx)| {
+                        tx.sign(&[from_keypair.as_ref(), to_keypair], blockhash);
+                    });
                 to_create_txs.iter().for_each(|(_, tx)| {
                     client.async_send_transaction(tx.clone()).expect("transfer");
                 });
@@ -809,11 +871,11 @@ pub fn create_token_accounts(client: &Client, signers: &[Arc<Keypair>], accounts
                 let mut waits = 0;
                 while !to_create_txs.is_empty() {
                     sleep(Duration::from_millis(200));
-                    to_create_txs.retain(|(_, tx)| !verify_transfer(client, &tx));
+                    to_create_txs.retain(|(_, tx)| !verify_transaction(client, &tx));
                     if to_create_txs.is_empty() {
                         break;
                     }
-                    debug!(
+                    info!(
                         "    {} transactions outstanding, waits {:?}",
                         to_create_txs.len(),
                         waits
@@ -826,18 +888,25 @@ pub fn create_token_accounts(client: &Client, signers: &[Arc<Keypair>], accounts
 
                 if !to_create_txs.is_empty() {
                     retries += 1;
-                    debug!("  Retry {:?}", retries);
+                    info!("  Retry {:?} {} txes left", retries, to_create_txs.len());
                     if retries >= 20 {
-                        error!("  Too many retries, give up");
+                        error!(
+                            "create_token_accounts: Too many retries ({}), give up",
+                            retries
+                        );
                         exit(1);
                     }
                 }
             }
         });
 
-        let mut new_notfunded: Vec<(&Arc<Keypair>, &Pubkey)> = vec![];
+        let mut new_notfunded: Vec<(&Arc<Keypair>, &Keypair)> = vec![];
         for f in &notfunded {
-            if client.get_balance(&f.1).unwrap_or(0) == 0 {
+            if client
+                .get_balance_with_commitment(&f.1.pubkey(), CommitmentConfig::recent())
+                .unwrap_or(0)
+                == 0
+            {
                 new_notfunded.push(*f)
             }
         }
@@ -893,8 +962,13 @@ fn generate_keypairs(num: u64) -> Vec<Keypair> {
     rnd.gen_n_keypairs(num)
 }
 
-pub fn airdrop_lamports(client: &Client, drone_addr: &SocketAddr, id: &Keypair, amount: u64) {
-    let balance = client.get_balance(&id.pubkey());
+pub fn airdrop_lamports<T: Client>(
+    client: &T,
+    faucet_addr: &SocketAddr,
+    id: &Keypair,
+    amount: u64,
+) {
+    let balance = client.get_balance_with_commitment(&id.pubkey(), CommitmentConfig::recent());
     let balance = balance.unwrap_or(0);
     if balance >= amount {
         return;
@@ -905,142 +979,49 @@ pub fn airdrop_lamports(client: &Client, drone_addr: &SocketAddr, id: &Keypair, 
     info!(
         "Airdropping {:?} lamports from {} for {}",
         amount_to_drop,
-        drone_addr,
+        faucet_addr,
         id.pubkey(),
     );
 
     let mut tries = 0;
     loop {
-        let (blockhash, _fee_calculator) = client
-            .get_recent_blockhash()
+        let (blockhash, _fee_calculator, _last_valid_slot) = client
+            .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
             .expect("Failed to get blockhash");
-        match request_airdrop_transaction(&drone_addr, &id.pubkey(), amount_to_drop, blockhash) {
+        match request_airdrop_transaction(&faucet_addr, &id.pubkey(), amount_to_drop, blockhash) {
             Ok(transaction) => {
                 let signature = client.async_send_transaction(transaction).unwrap();
 
                 for _ in 0..30 {
-                    if let Ok(Some(_)) = client.get_signature_status(&signature) {
+                    if let Ok(Some(_)) = client.get_signature_status_with_commitment(
+                        &signature,
+                        CommitmentConfig::recent(),
+                    ) {
                         break;
                     }
                     sleep(Duration::from_millis(100));
                 }
-                if client.get_balance(&id.pubkey()).unwrap_or(0) >= amount {
+                if client
+                    .get_balance_with_commitment(&id.pubkey(), CommitmentConfig::recent())
+                    .unwrap_or(0)
+                    >= amount
+                {
                     break;
                 }
             }
             Err(err) => {
                 panic!(
                     "Error requesting airdrop: {:?} to addr: {:?} amount: {}",
-                    err, drone_addr, amount
+                    err, faucet_addr, amount
                 );
             }
         };
         debug!("  Retry...");
         tries += 1;
         if tries > 50 {
-            error!("Too many retries, give up");
+            error!("airdrop_lamports: Too many retries ({}), give up", tries);
             exit(1);
         }
         sleep(Duration::from_secs(2));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use solana::gossip_service::{discover_cluster, get_multi_client};
-    use solana::local_cluster::{ClusterConfig, LocalCluster};
-    use solana::validator::ValidatorConfig;
-    use solana_drone::drone::run_local_drone;
-    use solana_exchange_api::exchange_processor::process_instruction;
-    use solana_runtime::bank::Bank;
-    use solana_runtime::bank_client::BankClient;
-    use solana_sdk::genesis_block::create_genesis_block;
-    use std::sync::mpsc::channel;
-
-    #[test]
-    fn test_exchange_local_cluster() {
-        solana_logger::setup();
-
-        const NUM_NODES: usize = 1;
-
-        let mut config = Config::default();
-        config.identity = Keypair::new();
-        config.duration = Duration::from_secs(1);
-        config.fund_amount = 100_000;
-        config.threads = 1;
-        config.transfer_delay = 20; // 15
-        config.batch_size = 100; // 1000;
-        config.chunk_size = 10; // 200;
-        config.account_groups = 1; // 10;
-        let Config {
-            fund_amount,
-            batch_size,
-            account_groups,
-            ..
-        } = config;
-        let accounts_in_groups = batch_size * account_groups;
-
-        let cluster = LocalCluster::new(&ClusterConfig {
-            node_stakes: vec![100_000; NUM_NODES],
-            cluster_lamports: 100_000_000_000_000,
-            validator_configs: vec![ValidatorConfig::default(); NUM_NODES],
-            native_instruction_processors: [solana_exchange_program!()].to_vec(),
-            ..ClusterConfig::default()
-        });
-
-        let drone_keypair = Keypair::new();
-        cluster.transfer(
-            &cluster.funding_keypair,
-            &drone_keypair.pubkey(),
-            2_000_000_000_000,
-        );
-
-        let (addr_sender, addr_receiver) = channel();
-        run_local_drone(drone_keypair, addr_sender, Some(1_000_000_000_000));
-        let drone_addr = addr_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-
-        info!("Connecting to the cluster");
-        let (nodes, _) = discover_cluster(&cluster.entry_point_info.gossip, NUM_NODES)
-            .unwrap_or_else(|err| {
-                error!("Failed to discover {} nodes: {:?}", NUM_NODES, err);
-                exit(1);
-            });
-
-        let (client, num_clients) = get_multi_client(&nodes);
-
-        info!("clients: {}", num_clients);
-        assert!(num_clients >= NUM_NODES);
-
-        const NUM_SIGNERS: u64 = 2;
-        airdrop_lamports(
-            &client,
-            &drone_addr,
-            &config.identity,
-            fund_amount * (accounts_in_groups + 1) as u64 * NUM_SIGNERS,
-        );
-
-        do_bench_exchange(vec![client], config);
-    }
-
-    #[test]
-    fn test_exchange_bank_client() {
-        solana_logger::setup();
-        let (genesis_block, identity) = create_genesis_block(100_000_000_000_000);
-        let mut bank = Bank::new(&genesis_block);
-        bank.add_instruction_processor(id(), process_instruction);
-        let clients = vec![BankClient::new(bank)];
-
-        let mut config = Config::default();
-        config.identity = identity;
-        config.duration = Duration::from_secs(1);
-        config.fund_amount = 100_000;
-        config.threads = 1;
-        config.transfer_delay = 20; // 0;
-        config.batch_size = 100; // 1500;
-        config.chunk_size = 10; // 1500;
-        config.account_groups = 1; // 50;
-
-        do_bench_exchange(clients, config);
     }
 }

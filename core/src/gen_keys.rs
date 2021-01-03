@@ -1,4 +1,4 @@
-//! The `signature` module provides functionality for public, and private keys.
+//! The `gen_keys` module makes lots of keypairs
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
@@ -41,7 +41,7 @@ impl GenKeys {
 mod tests {
     use super::*;
     pub use solana_sdk::pubkey::Pubkey;
-    use solana_sdk::signature::KeypairUtil;
+    use solana_sdk::signature::Signer;
     use std::collections::HashSet;
 
     #[test]

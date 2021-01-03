@@ -1,103 +1,171 @@
 //! Stakes serve as a cache of stake and vote accounts to derive
 //! node stakes
-use solana_sdk::account::Account;
-use solana_sdk::pubkey::Pubkey;
-use solana_stake_api::stake_state::StakeState;
-use solana_vote_api::vote_state::VoteState;
-use std::collections::HashMap;
+use crate::vote_account::{ArcVoteAccount, VoteAccounts};
+use solana_sdk::{
+    account::Account, clock::Epoch, pubkey::Pubkey, sysvar::stake_history::StakeHistory,
+};
+use solana_stake_program::stake_state::{new_stake_history_entry, Delegation, StakeState};
+use std::{borrow::Borrow, collections::HashMap};
 
-#[derive(Default, Clone, PartialEq, Debug, Deserialize, Serialize)]
+#[derive(Default, Clone, PartialEq, Debug, Deserialize, Serialize, AbiExample)]
 pub struct Stakes {
     /// vote accounts
-    vote_accounts: HashMap<Pubkey, (u64, Account)>,
+    vote_accounts: VoteAccounts,
 
-    /// stake_accounts
-    stake_accounts: HashMap<Pubkey, Account>,
+    /// stake_delegations
+    stake_delegations: HashMap<Pubkey, Delegation>,
 
-    /// unclaimed points.
-    //  a point is a credit multiplied by the stake
-    points: u64,
+    /// unused
+    unused: u64,
 
     /// current epoch, used to calculate current stake
-    epoch: u64,
+    epoch: Epoch,
+
+    /// history of staking levels
+    stake_history: StakeHistory,
 }
 
 impl Stakes {
-    pub fn clone_with_epoch(&self, epoch: u64) -> Self {
-        if self.epoch == epoch {
+    pub fn history(&self) -> &StakeHistory {
+        &self.stake_history
+    }
+    pub fn clone_with_epoch(&self, next_epoch: Epoch, fix_stake_deactivate: bool) -> Self {
+        let prev_epoch = self.epoch;
+        if prev_epoch == next_epoch {
             self.clone()
         } else {
+            // wrap up the prev epoch by adding new stake history entry for the prev epoch
+            let mut stake_history_upto_prev_epoch = self.stake_history.clone();
+            stake_history_upto_prev_epoch.add(
+                prev_epoch,
+                new_stake_history_entry(
+                    prev_epoch,
+                    self.stake_delegations
+                        .iter()
+                        .map(|(_pubkey, stake_delegation)| stake_delegation),
+                    Some(&self.stake_history),
+                    fix_stake_deactivate,
+                ),
+            );
+
+            // refresh the stake distribution of vote accounts for the next epoch, using new stake history
+            let vote_accounts_for_next_epoch = self
+                .vote_accounts
+                .iter()
+                .map(|(pubkey, (_ /*stake*/, account))| {
+                    let stake = self.calculate_stake(
+                        pubkey,
+                        next_epoch,
+                        Some(&stake_history_upto_prev_epoch),
+                        fix_stake_deactivate,
+                    );
+                    (*pubkey, (stake, account.clone()))
+                })
+                .collect();
+
             Stakes {
-                stake_accounts: self.stake_accounts.clone(),
-                points: self.points,
-                epoch,
-                vote_accounts: self
-                    .vote_accounts
-                    .iter()
-                    .map(|(pubkey, (_stake, account))| {
-                        (
-                            *pubkey,
-                            (self.calculate_stake(pubkey, epoch), account.clone()),
-                        )
-                    })
-                    .collect(),
+                stake_delegations: self.stake_delegations.clone(),
+                unused: self.unused,
+                epoch: next_epoch,
+                stake_history: stake_history_upto_prev_epoch,
+                vote_accounts: vote_accounts_for_next_epoch,
             }
         }
     }
 
     // sum the stakes that point to the given voter_pubkey
-    fn calculate_stake(&self, voter_pubkey: &Pubkey, epoch: u64) -> u64 {
-        self.stake_accounts
+    fn calculate_stake(
+        &self,
+        voter_pubkey: &Pubkey,
+        epoch: Epoch,
+        stake_history: Option<&StakeHistory>,
+        fix_stake_deactivate: bool,
+    ) -> u64 {
+        self.stake_delegations
             .iter()
-            .map(|(_, stake_account)| {
-                StakeState::stake_from(stake_account).map_or(0, |stake| {
-                    if stake.voter_pubkey == *voter_pubkey {
-                        stake.stake(epoch)
-                    } else {
-                        0
-                    }
-                })
+            .map(|(_, stake_delegation)| {
+                if &stake_delegation.voter_pubkey == voter_pubkey {
+                    stake_delegation.stake(epoch, stake_history, fix_stake_deactivate)
+                } else {
+                    0
+                }
             })
             .sum()
     }
 
-    pub fn is_stake(account: &Account) -> bool {
-        solana_vote_api::check_id(&account.owner) || solana_stake_api::check_id(&account.owner)
+    pub fn vote_balance_and_staked(&self) -> u64 {
+        self.stake_delegations
+            .iter()
+            .map(|(_, stake_delegation)| stake_delegation.stake)
+            .sum::<u64>()
+            + self
+                .vote_accounts
+                .iter()
+                .map(|(_pubkey, (_staked, vote_account))| vote_account.lamports())
+                .sum::<u64>()
     }
 
-    pub fn store(&mut self, pubkey: &Pubkey, account: &Account) {
-        if solana_vote_api::check_id(&account.owner) {
-            if account.lamports == 0 {
-                self.vote_accounts.remove(pubkey);
-            } else {
-                let old = self.vote_accounts.get(pubkey);
+    pub fn is_stake(account: &Account) -> bool {
+        solana_vote_program::check_id(&account.owner)
+            || solana_stake_program::check_id(&account.owner)
+                && account.data.len() >= std::mem::size_of::<StakeState>()
+    }
 
-                let stake = old.map_or_else(|| self.calculate_stake(pubkey, self.epoch), |v| v.0);
+    pub fn store(
+        &mut self,
+        pubkey: &Pubkey,
+        account: &Account,
+        fix_stake_deactivate: bool,
+    ) -> Option<ArcVoteAccount> {
+        if solana_vote_program::check_id(&account.owner) {
+            // unconditionally remove existing at first; there is no dependent calculated state for
+            // votes, not like stakes (stake codepath maintains calculated stake value grouped by
+            // delegated vote pubkey)
+            let old = self.vote_accounts.remove(pubkey);
+            // when account is removed (lamports == 0), don't readd so that given
+            // `pubkey` can be used for any owner in the future, while not
+            // affecting Stakes.
+            if account.lamports != 0 {
+                let stake = old.as_ref().map_or_else(
+                    || {
+                        self.calculate_stake(
+                            pubkey,
+                            self.epoch,
+                            Some(&self.stake_history),
+                            fix_stake_deactivate,
+                        )
+                    },
+                    |v| v.0,
+                );
 
-                // count any increase in points, can only go forward
-                let old_credits = old
-                    .and_then(|(_stake, old_account)| VoteState::credits_from(old_account))
-                    .unwrap_or(0);
-
-                let credits = VoteState::credits_from(account).unwrap_or(old_credits);
-
-                self.points += credits.saturating_sub(old_credits) * stake;
-
-                self.vote_accounts.insert(*pubkey, (stake, account.clone()));
+                self.vote_accounts
+                    .insert(*pubkey, (stake, ArcVoteAccount::from(account.clone())));
             }
-        } else if solana_stake_api::check_id(&account.owner) {
+            old.map(|(_, account)| account)
+        } else if solana_stake_program::check_id(&account.owner) {
             //  old_stake is stake lamports and voter_pubkey from the pre-store() version
-            let old_stake = self.stake_accounts.get(pubkey).and_then(|old_account| {
-                StakeState::stake_from(old_account)
-                    .map(|stake| (stake.voter_pubkey, stake.stake(self.epoch)))
+            let old_stake = self.stake_delegations.get(pubkey).map(|delegation| {
+                (
+                    delegation.voter_pubkey,
+                    delegation.stake(self.epoch, Some(&self.stake_history), fix_stake_deactivate),
+                )
             });
 
-            let stake = StakeState::stake_from(account).map(|stake| {
+            let delegation = StakeState::delegation_from(account);
+
+            let stake = delegation.map(|delegation| {
                 (
-                    stake.voter_pubkey,
+                    delegation.voter_pubkey,
                     if account.lamports != 0 {
-                        stake.stake(self.epoch)
+                        delegation.stake(
+                            self.epoch,
+                            Some(&self.stake_history),
+                            fix_stake_deactivate,
+                        )
                     } else {
+                        // when account is removed (lamports == 0), this special `else` clause ensures
+                        // resetting cached stake value below, even if the account happens to be
+                        // still staked for some (odd) reason
                         0
                     },
                 )
@@ -106,69 +174,65 @@ impl Stakes {
             // if adjustments need to be made...
             if stake != old_stake {
                 if let Some((voter_pubkey, stake)) = old_stake {
-                    self.vote_accounts
-                        .entry(voter_pubkey)
-                        .and_modify(|e| e.0 -= stake);
+                    self.vote_accounts.sub_stake(&voter_pubkey, stake);
                 }
                 if let Some((voter_pubkey, stake)) = stake {
-                    self.vote_accounts
-                        .entry(voter_pubkey)
-                        .and_modify(|e| e.0 += stake);
+                    self.vote_accounts.add_stake(&voter_pubkey, stake);
                 }
             }
 
             if account.lamports == 0 {
-                self.stake_accounts.remove(pubkey);
-            } else {
-                self.stake_accounts.insert(*pubkey, account.clone());
+                // when account is removed (lamports == 0), remove it from Stakes as well
+                // so that given `pubkey` can be used for any owner in the future, while not
+                // affecting Stakes.
+                self.stake_delegations.remove(pubkey);
+            } else if let Some(delegation) = delegation {
+                self.stake_delegations.insert(*pubkey, delegation);
             }
+            None
+        } else {
+            // there is no need to remove possibly existing Stakes cache entries with given
+            // `pubkey` because this isn't possible, first of all.
+            // Runtime always enforces an intermediary write of account.lamports == 0,
+            // when not-System111-owned account.owner is swapped.
+            None
         }
     }
-    pub fn vote_accounts(&self) -> &HashMap<Pubkey, (u64, Account)> {
-        &self.vote_accounts
+
+    pub fn vote_accounts(&self) -> &HashMap<Pubkey, (u64, ArcVoteAccount)> {
+        self.vote_accounts.borrow()
     }
 
-    pub fn rewards_pools(&self) -> impl Iterator<Item = (&Pubkey, &Account)> {
-        self.stake_accounts
-            .iter()
-            .filter(|(_key, account)| match StakeState::from(account) {
-                Some(StakeState::RewardsPool) => true,
-                _ => false,
-            })
+    pub fn stake_delegations(&self) -> &HashMap<Pubkey, Delegation> {
+        &self.stake_delegations
+    }
+
+    pub fn staked_nodes(&self) -> HashMap<Pubkey, u64> {
+        self.vote_accounts.staked_nodes()
     }
 
     pub fn highest_staked_node(&self) -> Option<Pubkey> {
-        self.vote_accounts
+        let (_pubkey, (_stake, vote_account)) = self
+            .vote_accounts
             .iter()
-            .max_by(|(_ak, av), (_bk, bv)| av.0.cmp(&bv.0))
-            .and_then(|(_k, (_stake, account))| VoteState::from(account))
-            .map(|vote_state| vote_state.node_pubkey)
-    }
-
-    /// currently unclaimed points
-    pub fn points(&self) -> u64 {
-        self.points
-    }
-
-    /// "claims" points, resets points to 0
-    pub fn claim_points(&mut self) -> u64 {
-        let points = self.points;
-        self.points = 0;
-        points
+            .max_by(|(_ak, av), (_bk, bv)| av.0.cmp(&bv.0))?;
+        let node_pubkey = vote_account.vote_state().as_ref().ok()?.node_pubkey;
+        Some(node_pubkey)
     }
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use solana_sdk::pubkey::Pubkey;
-    use solana_stake_api::stake_state::{self, STAKE_WARMUP_EPOCHS};
-    use solana_vote_api::vote_state::{self, VoteState, MAX_LOCKOUT_HISTORY};
+    use solana_sdk::{pubkey::Pubkey, rent::Rent};
+    use solana_stake_program::stake_state;
+    use solana_vote_program::vote_state::{self, VoteState};
 
     //  set up some dummies for a staked node     ((     vote      )  (     stake     ))
     pub fn create_staked_node_accounts(stake: u64) -> ((Pubkey, Account), (Pubkey, Account)) {
-        let vote_pubkey = Pubkey::new_rand();
-        let vote_account = vote_state::create_account(&vote_pubkey, &Pubkey::new_rand(), 0, 1);
+        let vote_pubkey = solana_sdk::pubkey::new_rand();
+        let vote_account =
+            vote_state::create_account(&vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1);
         (
             (vote_pubkey, vote_account),
             create_stake_account(stake, &vote_pubkey),
@@ -177,50 +241,101 @@ pub mod tests {
 
     //   add stake to a vote_pubkey                               (   stake    )
     pub fn create_stake_account(stake: u64, vote_pubkey: &Pubkey) -> (Pubkey, Account) {
+        let stake_pubkey = solana_sdk::pubkey::new_rand();
         (
-            Pubkey::new_rand(),
-            stake_state::create_stake_account(&vote_pubkey, &VoteState::default(), stake),
+            stake_pubkey,
+            stake_state::create_account(
+                &stake_pubkey,
+                &vote_pubkey,
+                &vote_state::create_account(&vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1),
+                &Rent::free(),
+                stake,
+            ),
+        )
+    }
+
+    pub fn create_warming_staked_node_accounts(
+        stake: u64,
+        epoch: Epoch,
+    ) -> ((Pubkey, Account), (Pubkey, Account)) {
+        let vote_pubkey = solana_sdk::pubkey::new_rand();
+        let vote_account =
+            vote_state::create_account(&vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1);
+        (
+            (vote_pubkey, vote_account),
+            create_warming_stake_account(stake, epoch, &vote_pubkey),
+        )
+    }
+
+    // add stake to a vote_pubkey                               (   stake    )
+    pub fn create_warming_stake_account(
+        stake: u64,
+        epoch: Epoch,
+        vote_pubkey: &Pubkey,
+    ) -> (Pubkey, Account) {
+        let stake_pubkey = solana_sdk::pubkey::new_rand();
+        (
+            stake_pubkey,
+            stake_state::create_account_with_activation_epoch(
+                &stake_pubkey,
+                &vote_pubkey,
+                &vote_state::create_account(&vote_pubkey, &solana_sdk::pubkey::new_rand(), 0, 1),
+                &Rent::free(),
+                stake,
+                epoch,
+            ),
         )
     }
 
     #[test]
     fn test_stakes_basic() {
-        for i in 0..STAKE_WARMUP_EPOCHS + 1 {
-            let mut stakes = Stakes::default();
-            stakes.epoch = i;
+        for i in 0..4 {
+            let mut stakes = Stakes {
+                epoch: i,
+                ..Stakes::default()
+            };
 
             let ((vote_pubkey, vote_account), (stake_pubkey, mut stake_account)) =
                 create_staked_node_accounts(10);
 
-            stakes.store(&vote_pubkey, &vote_account);
-            stakes.store(&stake_pubkey, &stake_account);
+            stakes.store(&vote_pubkey, &vote_account, true);
+            stakes.store(&stake_pubkey, &stake_account, true);
             let stake = StakeState::stake_from(&stake_account).unwrap();
             {
                 let vote_accounts = stakes.vote_accounts();
                 assert!(vote_accounts.get(&vote_pubkey).is_some());
-                assert_eq!(vote_accounts.get(&vote_pubkey).unwrap().0, stake.stake(i));
+                assert_eq!(
+                    vote_accounts.get(&vote_pubkey).unwrap().0,
+                    stake.stake(i, None, true)
+                );
             }
 
             stake_account.lamports = 42;
-            stakes.store(&stake_pubkey, &stake_account);
+            stakes.store(&stake_pubkey, &stake_account, true);
             {
                 let vote_accounts = stakes.vote_accounts();
                 assert!(vote_accounts.get(&vote_pubkey).is_some());
-                assert_eq!(vote_accounts.get(&vote_pubkey).unwrap().0, stake.stake(i)); // stays old stake, because only 10 is activated
+                assert_eq!(
+                    vote_accounts.get(&vote_pubkey).unwrap().0,
+                    stake.stake(i, None, true)
+                ); // stays old stake, because only 10 is activated
             }
 
             // activate more
             let (_stake_pubkey, mut stake_account) = create_stake_account(42, &vote_pubkey);
-            stakes.store(&stake_pubkey, &stake_account);
+            stakes.store(&stake_pubkey, &stake_account, true);
             let stake = StakeState::stake_from(&stake_account).unwrap();
             {
                 let vote_accounts = stakes.vote_accounts();
                 assert!(vote_accounts.get(&vote_pubkey).is_some());
-                assert_eq!(vote_accounts.get(&vote_pubkey).unwrap().0, stake.stake(i)); // now stake of 42 is activated
+                assert_eq!(
+                    vote_accounts.get(&vote_pubkey).unwrap().0,
+                    stake.stake(i, None, true)
+                ); // now stake of 42 is activated
             }
 
             stake_account.lamports = 0;
-            stakes.store(&stake_pubkey, &stake_account);
+            stakes.store(&stake_pubkey, &stake_account, true);
             {
                 let vote_accounts = stakes.vote_accounts();
                 assert!(vote_accounts.get(&vote_pubkey).is_some());
@@ -238,14 +353,14 @@ pub mod tests {
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes.store(&vote_pubkey, &vote_account);
-        stakes.store(&stake_pubkey, &stake_account);
+        stakes.store(&vote_pubkey, &vote_account, true);
+        stakes.store(&stake_pubkey, &stake_account, true);
 
         let ((vote11_pubkey, vote11_account), (stake11_pubkey, stake11_account)) =
             create_staked_node_accounts(20);
 
-        stakes.store(&vote11_pubkey, &vote11_account);
-        stakes.store(&stake11_pubkey, &stake11_account);
+        stakes.store(&vote11_pubkey, &vote11_account, true);
+        stakes.store(&stake11_pubkey, &stake11_account, true);
 
         let vote11_node_pubkey = VoteState::from(&vote11_account).unwrap().node_pubkey;
 
@@ -253,61 +368,17 @@ pub mod tests {
     }
 
     #[test]
-    fn test_stakes_points() {
-        let mut stakes = Stakes::default();
-        stakes.epoch = STAKE_WARMUP_EPOCHS + 1;
-
-        let stake = 42;
-        assert_eq!(stakes.points(), 0);
-        assert_eq!(stakes.claim_points(), 0);
-        assert_eq!(stakes.claim_points(), 0);
-
-        let ((vote_pubkey, mut vote_account), (stake_pubkey, stake_account)) =
-            create_staked_node_accounts(stake);
-
-        stakes.store(&vote_pubkey, &vote_account);
-        stakes.store(&stake_pubkey, &stake_account);
-
-        assert_eq!(stakes.points(), 0);
-        assert_eq!(stakes.claim_points(), 0);
-
-        let mut vote_state = VoteState::from(&vote_account).unwrap();
-        for i in 0..MAX_LOCKOUT_HISTORY + 42 {
-            vote_state.process_slot_vote_unchecked(i as u64);
-            vote_state.to(&mut vote_account).unwrap();
-            stakes.store(&vote_pubkey, &vote_account);
-            assert_eq!(stakes.points(), vote_state.credits() * stake);
-        }
-        vote_account.lamports = 0;
-        stakes.store(&vote_pubkey, &vote_account);
-        assert_eq!(stakes.points(), vote_state.credits() * stake);
-
-        assert_eq!(stakes.claim_points(), vote_state.credits() * stake);
-        assert_eq!(stakes.claim_points(), 0);
-        assert_eq!(stakes.claim_points(), 0);
-
-        // points come out of nowhere, but don't care here ;)
-        vote_account.lamports = 1;
-        stakes.store(&vote_pubkey, &vote_account);
-        assert_eq!(stakes.points(), vote_state.credits() * stake);
-
-        // test going backwards, should never go backwards
-        let old_vote_state = vote_state;
-        let vote_account = vote_state::create_account(&vote_pubkey, &Pubkey::new_rand(), 0, 1);
-        stakes.store(&vote_pubkey, &vote_account);
-        assert_eq!(stakes.points(), old_vote_state.credits() * stake);
-    }
-
-    #[test]
     fn test_stakes_vote_account_disappear_reappear() {
-        let mut stakes = Stakes::default();
-        stakes.epoch = STAKE_WARMUP_EPOCHS + 1;
+        let mut stakes = Stakes {
+            epoch: 4,
+            ..Stakes::default()
+        };
 
         let ((vote_pubkey, mut vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes.store(&vote_pubkey, &vote_account);
-        stakes.store(&stake_pubkey, &stake_account);
+        stakes.store(&vote_pubkey, &vote_account, true);
+        stakes.store(&stake_pubkey, &stake_account, true);
 
         {
             let vote_accounts = stakes.vote_accounts();
@@ -316,14 +387,14 @@ pub mod tests {
         }
 
         vote_account.lamports = 0;
-        stakes.store(&vote_pubkey, &vote_account);
+        stakes.store(&vote_pubkey, &vote_account, true);
 
         {
             let vote_accounts = stakes.vote_accounts();
             assert!(vote_accounts.get(&vote_pubkey).is_none());
         }
         vote_account.lamports = 1;
-        stakes.store(&vote_pubkey, &vote_account);
+        stakes.store(&vote_pubkey, &vote_account, true);
 
         {
             let vote_accounts = stakes.vote_accounts();
@@ -334,8 +405,10 @@ pub mod tests {
 
     #[test]
     fn test_stakes_change_delegate() {
-        let mut stakes = Stakes::default();
-        stakes.epoch = STAKE_WARMUP_EPOCHS + 1;
+        let mut stakes = Stakes {
+            epoch: 4,
+            ..Stakes::default()
+        };
 
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
@@ -343,11 +416,11 @@ pub mod tests {
         let ((vote_pubkey2, vote_account2), (_stake_pubkey2, stake_account2)) =
             create_staked_node_accounts(10);
 
-        stakes.store(&vote_pubkey, &vote_account);
-        stakes.store(&vote_pubkey2, &vote_account2);
+        stakes.store(&vote_pubkey, &vote_account, true);
+        stakes.store(&vote_pubkey2, &vote_account2, true);
 
         // delegates to vote_pubkey
-        stakes.store(&stake_pubkey, &stake_account);
+        stakes.store(&stake_pubkey, &stake_account, true);
 
         let stake = StakeState::stake_from(&stake_account).unwrap();
 
@@ -356,14 +429,14 @@ pub mod tests {
             assert!(vote_accounts.get(&vote_pubkey).is_some());
             assert_eq!(
                 vote_accounts.get(&vote_pubkey).unwrap().0,
-                stake.stake(stakes.epoch)
+                stake.stake(stakes.epoch, Some(&stakes.stake_history), true)
             );
             assert!(vote_accounts.get(&vote_pubkey2).is_some());
             assert_eq!(vote_accounts.get(&vote_pubkey2).unwrap().0, 0);
         }
 
         // delegates to vote_pubkey2
-        stakes.store(&stake_pubkey, &stake_account2);
+        stakes.store(&stake_pubkey, &stake_account2, true);
 
         {
             let vote_accounts = stakes.vote_accounts();
@@ -372,25 +445,27 @@ pub mod tests {
             assert!(vote_accounts.get(&vote_pubkey2).is_some());
             assert_eq!(
                 vote_accounts.get(&vote_pubkey2).unwrap().0,
-                stake.stake(stakes.epoch)
+                stake.stake(stakes.epoch, Some(&stakes.stake_history), true)
             );
         }
     }
     #[test]
     fn test_stakes_multiple_stakers() {
-        let mut stakes = Stakes::default();
-        stakes.epoch = STAKE_WARMUP_EPOCHS + 1;
+        let mut stakes = Stakes {
+            epoch: 4,
+            ..Stakes::default()
+        };
 
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
         let (stake_pubkey2, stake_account2) = create_stake_account(10, &vote_pubkey);
 
-        stakes.store(&vote_pubkey, &vote_account);
+        stakes.store(&vote_pubkey, &vote_account, true);
 
         // delegates to vote_pubkey
-        stakes.store(&stake_pubkey, &stake_account);
-        stakes.store(&stake_pubkey2, &stake_account2);
+        stakes.store(&stake_pubkey, &stake_account, true);
+        stakes.store(&stake_pubkey2, &stake_account2, true);
 
         {
             let vote_accounts = stakes.vote_accounts();
@@ -405,37 +480,39 @@ pub mod tests {
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes.store(&vote_pubkey, &vote_account);
-        stakes.store(&stake_pubkey, &stake_account);
+        stakes.store(&vote_pubkey, &vote_account, true);
+        stakes.store(&stake_pubkey, &stake_account, true);
         let stake = StakeState::stake_from(&stake_account).unwrap();
 
         {
             let vote_accounts = stakes.vote_accounts();
             assert_eq!(
                 vote_accounts.get(&vote_pubkey).unwrap().0,
-                stake.stake(stakes.epoch)
+                stake.stake(stakes.epoch, Some(&stakes.stake_history), true)
             );
         }
-        let stakes = stakes.clone_with_epoch(3);
+        let stakes = stakes.clone_with_epoch(3, true);
         {
             let vote_accounts = stakes.vote_accounts();
             assert_eq!(
                 vote_accounts.get(&vote_pubkey).unwrap().0,
-                stake.stake(stakes.epoch)
+                stake.stake(stakes.epoch, Some(&stakes.stake_history), true)
             );
         }
     }
 
     #[test]
     fn test_stakes_not_delegate() {
-        let mut stakes = Stakes::default();
-        stakes.epoch = STAKE_WARMUP_EPOCHS + 1;
+        let mut stakes = Stakes {
+            epoch: 4,
+            ..Stakes::default()
+        };
 
         let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
             create_staked_node_accounts(10);
 
-        stakes.store(&vote_pubkey, &vote_account);
-        stakes.store(&stake_pubkey, &stake_account);
+        stakes.store(&vote_pubkey, &vote_account, true);
+        stakes.store(&stake_pubkey, &stake_account, true);
 
         {
             let vote_accounts = stakes.vote_accounts();
@@ -444,7 +521,11 @@ pub mod tests {
         }
 
         // not a stake account, and whacks above entry
-        stakes.store(&stake_pubkey, &Account::new(1, 0, &solana_stake_api::id()));
+        stakes.store(
+            &stake_pubkey,
+            &Account::new(1, 0, &solana_stake_program::id()),
+            true,
+        );
         {
             let vote_accounts = stakes.vote_accounts();
             assert!(vote_accounts.get(&vote_pubkey).is_some());
@@ -452,4 +533,42 @@ pub mod tests {
         }
     }
 
+    #[test]
+    fn test_vote_balance_and_staked_empty() {
+        let stakes = Stakes::default();
+        assert_eq!(stakes.vote_balance_and_staked(), 0);
+    }
+
+    #[test]
+    fn test_vote_balance_and_staked_normal() {
+        let mut stakes = Stakes::default();
+        impl Stakes {
+            pub fn vote_balance_and_warmed_staked(&self) -> u64 {
+                self.vote_accounts
+                    .iter()
+                    .map(|(_pubkey, (staked, account))| staked + account.lamports())
+                    .sum()
+            }
+        }
+
+        let genesis_epoch = 0;
+        let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
+            create_warming_staked_node_accounts(10, genesis_epoch);
+        stakes.store(&vote_pubkey, &vote_account, true);
+        stakes.store(&stake_pubkey, &stake_account, true);
+
+        assert_eq!(stakes.vote_balance_and_staked(), 11);
+        assert_eq!(stakes.vote_balance_and_warmed_staked(), 1);
+
+        for (epoch, expected_warmed_stake) in ((genesis_epoch + 1)..=3).zip(&[2, 3, 4]) {
+            stakes = stakes.clone_with_epoch(epoch, true);
+            // vote_balance_and_staked() always remain to return same lamports
+            // while vote_balance_and_warmed_staked() gradually increases
+            assert_eq!(stakes.vote_balance_and_staked(), 11);
+            assert_eq!(
+                stakes.vote_balance_and_warmed_staked(),
+                *expected_warmed_stake
+            );
+        }
+    }
 }

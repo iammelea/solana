@@ -7,6 +7,10 @@ cloud_DefaultZone() {
   echo "us-east-1b"
 }
 
+cloud_RestartPreemptedInstances() {
+  : # Not implemented
+}
+
 # AWS region is zone with the last character removed
 __cloud_GetRegion() {
   declare zone="$1"
@@ -15,9 +19,7 @@ __cloud_GetRegion() {
   echo "$region"
 }
 
-# sshPrivateKey should be globally defined whenever this function is called.
-#
-# TODO: Remove usage of the sshPrivateKey global
+# Note: sshPrivateKey should be globally defined whenever this function is called.
 __cloud_SshPrivateKeyCheck() {
   # shellcheck disable=SC2154
   if [[ -z $sshPrivateKey ]]; then
@@ -148,6 +150,8 @@ cloud_Initialize() {
 # address       - Optional name of the GCE static IP address to attach to the
 #                 instance.  Requires that |numNodes| = 1 and that addressName
 #                 has been provisioned in the GCE region that is hosting |zone|
+# bootDiskType  - Optional specify SSD or HDD boot disk
+# additionalDiskSize - Optional specify size of additional storage volume
 #
 # Tip: use cloud_FindInstances to locate the instances once this function
 #      returns
@@ -168,8 +172,8 @@ cloud_CreateInstances() {
     #
     # Custom Ubuntu 18.04 LTS image with CUDA 9.2 and CUDA 10.0 installed
     #
-    # TODO: Unfortunately these AMIs are not public.  When this becomes an issue,
-    # use the stock Ubuntu 18.04 image and programmatically install CUDA after the
+    # Unfortunately these AMIs are not public.  When this becomes an issue, use
+    # the stock Ubuntu 18.04 image and programmatically install CUDA after the
     # instance boots
     #
     case $region in
@@ -281,9 +285,10 @@ cloud_CreateInstances() {
     IFS=: read -r instanceId publicIp privateIp zone < <(echo "${instances[0]}")
     (
       set -x
-      # TODO: Poll that the instance has moved to the 'running' state instead of
-      #       blindly sleeping for 30 seconds...
+      # It would be better to poll that the instance has moved to the 'running'
+      # state instead of blindly sleeping for 30 seconds...
       sleep 30
+
       declare region=
       region=$(__cloud_GetRegion "$zone")
       aws ec2 associate-address \
@@ -380,4 +385,21 @@ cloud_FetchFile() {
       -F /dev/null \
       "solana@$publicIp:$remoteFile" "$localFile"
   )
+}
+
+#
+# cloud_CreateAndAttachPersistentDisk
+#
+# Not yet implemented for this cloud provider
+cloud_CreateAndAttachPersistentDisk() {
+  echo "ERROR: cloud_CreateAndAttachPersistentDisk is not yet implemented for ec2"
+  exit 1
+}
+
+#
+# cloud_StatusAll
+#
+# Not yet implemented for this cloud provider
+cloud_StatusAll() {
+  echo "ERROR: cloud_StatusAll is not yet implemented for ec2"
 }

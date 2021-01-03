@@ -1,25 +1,21 @@
-use solana_runtime::bank::Bank;
-use solana_runtime::bank_client::BankClient;
-use solana_runtime::loader_utils::{create_invoke_instruction, load_program};
-use solana_sdk::client::SyncClient;
-use solana_sdk::genesis_block::create_genesis_block;
-use solana_sdk::native_loader;
-use solana_sdk::signature::KeypairUtil;
+use solana_runtime::{
+    bank::Bank, bank_client::BankClient, loader_utils::create_invoke_instruction,
+};
+use solana_sdk::{client::SyncClient, genesis_config::create_genesis_config, signature::Signer};
 
 #[test]
 fn test_program_native_noop() {
     solana_logger::setup();
 
-    let (genesis_block, alice_keypair) = create_genesis_block(50);
-    let bank = Bank::new(&genesis_block);
-    let bank_client = BankClient::new(bank);
-
-    let program = "solana_noop_program".as_bytes().to_vec();
-    let program_id = load_program(&bank_client, &alice_keypair, &native_loader::id(), program);
+    let (genesis_config, alice_keypair) = create_genesis_config(50);
+    let program_id = solana_sdk::pubkey::new_rand();
+    let bank = Bank::new(&genesis_config);
+    bank.add_native_program("solana_noop_program", &program_id, false);
 
     // Call user program
     let instruction = create_invoke_instruction(alice_keypair.pubkey(), program_id, &1u8);
+    let bank_client = BankClient::new(bank);
     bank_client
-        .send_instruction(&alice_keypair, instruction)
+        .send_and_confirm_instruction(&alice_keypair, instruction)
         .unwrap();
 }

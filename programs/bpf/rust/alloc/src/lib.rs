@@ -1,36 +1,30 @@
 //! @brief Example Rust-based BPF program that test dynamic memory allocation
-#![no_std]
-#![allow(unused_attributes)]
 
 #[macro_use]
 extern crate alloc;
-extern crate solana_sdk_bpf_utils;
-
-use alloc::vec::Vec;
-use core::alloc::Layout;
-use core::mem;
-use solana_sdk_bpf_utils::info;
+use solana_program::{custom_panic_default, entrypoint::SUCCESS, msg};
+use std::{alloc::Layout, mem};
 
 #[no_mangle]
-pub extern "C" fn entrypoint(_input: *mut u8) -> bool {
+pub extern "C" fn entrypoint(_input: *mut u8) -> u64 {
     unsafe {
         // Confirm large allocation fails
 
-        let layout = Layout::from_size_align(core::usize::MAX, mem::align_of::<u8>()).unwrap();
+        let layout = Layout::from_size_align(std::usize::MAX, mem::align_of::<u8>()).unwrap();
         let ptr = alloc::alloc::alloc(layout);
         if !ptr.is_null() {
-            info!("Error: Alloc of very larger buffer should fail");
+            msg!("Error: Alloc of very larger buffer should fail");
             panic!();
         }
     }
 
     unsafe {
-        // Test modest allocation and deallocation
+        // Test modest allocation and de-allocation
 
         let layout = Layout::from_size_align(100, mem::align_of::<u8>()).unwrap();
         let ptr = alloc::alloc::alloc(layout);
         if ptr.is_null() {
-            info!("Error: Alloc of 100 bytes failed");
+            msg!("Error: Alloc of 100 bytes failed");
             alloc::alloc::handle_alloc_error(layout);
         }
         alloc::alloc::dealloc(ptr, layout);
@@ -40,10 +34,10 @@ pub extern "C" fn entrypoint(_input: *mut u8) -> bool {
         // Test allocated memory read and write
 
         const ITERS: usize = 100;
-        let layout = Layout::from_size_align(100, mem::align_of::<u8>()).unwrap();
+        let layout = Layout::from_size_align(ITERS, mem::align_of::<u8>()).unwrap();
         let ptr = alloc::alloc::alloc(layout);
         if ptr.is_null() {
-            info!("Error: Alloc failed");
+            msg!("Error: Alloc failed");
             alloc::alloc::handle_alloc_error(layout);
         }
         for i in 0..ITERS {
@@ -52,29 +46,10 @@ pub extern "C" fn entrypoint(_input: *mut u8) -> bool {
         for i in 0..ITERS {
             assert_eq!(*ptr.add(i as usize), i as u8);
         }
-        info!(0x3, 0, 0, 0, u64::from(*ptr.add(42)));
+        msg!(0x3, 0, 0, 0, u64::from(*ptr.add(42)));
         assert_eq!(*ptr.add(42), 42);
         alloc::alloc::dealloc(ptr, layout);
     }
-
-    // // TODO not supported for system or bump allocator
-    // unsafe {
-    //     // Test alloc all bytes and one more (assumes heap size of 2048)
-
-    //     let layout = Layout::from_size_align(2048, mem::align_of::<u8>()).unwrap();
-    //     let ptr = alloc::alloc::alloc(layout);
-    //     if ptr.is_null() {
-    //         info!("Error: Alloc of 2048 bytes failed");
-    //         alloc::alloc::handle_alloc_error(layout);
-    //     }
-    //     let layout = Layout::from_size_align(1, mem::align_of::<u8>()).unwrap();
-    //     let ptr_fail = alloc::alloc::alloc(layout);
-    //     if !ptr_fail.is_null() {
-    //         info!("Error: Able to alloc 1 more then max");
-    //         panic!();
-    //     }
-    //     alloc::alloc::dealloc(ptr, layout);
-    // }
 
     {
         // Test allocated vector
@@ -86,12 +61,12 @@ pub extern "C" fn entrypoint(_input: *mut u8) -> bool {
         for v in ones.iter() {
             sum += ones[*v];
         }
-        info!(0x0, 0, 0, 0, sum as u64);
+        msg!(0x0, 0, 0, 0, sum as u64);
         assert_eq!(sum, ITERS);
     }
 
     {
-        // TODO test Vec::new()
+        // test Vec::new()
 
         const ITERS: usize = 100;
         let mut v = Vec::new();
@@ -99,10 +74,21 @@ pub extern "C" fn entrypoint(_input: *mut u8) -> bool {
         for i in 0..ITERS {
             v.push(i);
         }
-        info!(0x4, 0, 0, 0, v.len() as u64);
+        msg!(0x4, 0, 0, 0, v.len() as u64);
         assert_eq!(v.len(), ITERS);
     }
 
-    info!("Success");
-    true
+    SUCCESS
+}
+
+custom_panic_default!();
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_entrypoint() {
+        assert_eq!(SUCCESS, entrypoint(std::ptr::null_mut()));
+    }
 }

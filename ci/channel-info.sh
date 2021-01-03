@@ -89,12 +89,20 @@ BETA_CHANNEL_LATEST_TAG=${beta_tag:+v$beta_tag}
 STABLE_CHANNEL_LATEST_TAG=${stable_tag:+v$stable_tag}
 
 
-if [[ $CI_BRANCH = "$STABLE_CHANNEL" ]]; then
-  CHANNEL=stable
-elif [[ $CI_BRANCH = "$EDGE_CHANNEL" ]]; then
-  CHANNEL=edge
-elif [[ $CI_BRANCH = "$BETA_CHANNEL" ]]; then
-  CHANNEL=beta
+if [[ -n $CI_BASE_BRANCH ]]; then
+  BRANCH="$CI_BASE_BRANCH"
+elif [[ -n $CI_BRANCH ]]; then
+  BRANCH="$CI_BRANCH"
+fi
+
+if [[ -z "$CHANNEL" ]]; then
+  if [[ $BRANCH = "$STABLE_CHANNEL" ]]; then
+    CHANNEL=stable
+  elif [[ $BRANCH = "$EDGE_CHANNEL" ]]; then
+    CHANNEL=edge
+  elif [[ $BRANCH = "$BETA_CHANNEL" ]]; then
+    CHANNEL=beta
+  fi
 fi
 
 echo EDGE_CHANNEL="$EDGE_CHANNEL"

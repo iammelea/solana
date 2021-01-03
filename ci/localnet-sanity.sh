@@ -5,7 +5,6 @@ skipSetup=false
 iterations=1
 restartInterval=never
 rollingRestart=false
-maybeNoLeaderRotation=
 extraNodes=0
 walletRpcPort=:8899
 
@@ -30,7 +29,7 @@ Start a local cluster and run sanity on it
    -x          - Add an extra validator (may be supplied multiple times)
    -r          - Select the RPC endpoint hosted by a node that starts as
                  a validator node.  If unspecified the RPC endpoint hosted by
-                 the bootstrap leader will be used.
+                 the bootstrap validator will be used.
    -c          - Reuse existing node/ledger configuration from a previous sanity
                  run
 
@@ -54,9 +53,6 @@ while getopts "ch?i:k:brxR" opt; do
   k)
     restartInterval=$OPTARG
     ;;
-  b)
-    maybeNoLeaderRotation="--stake 0"
-    ;;
   x)
     extraNodes=$((extraNodes + 1))
     ;;
@@ -74,30 +70,34 @@ done
 
 source ci/upload-ci-artifact.sh
 source scripts/configure-metrics.sh
+source multinode-demo/common.sh
 
 nodes=(
-  "multinode-demo/drone.sh"
-  "multinode-demo/bootstrap-leader.sh \
-    --enable-rpc-exit \
+  "multinode-demo/bootstrap-validator.sh \
     --no-restart \
-    --init-complete-file init-complete-node1.log"
+    --init-complete-file init-complete-node0.log \
+    --dynamic-port-range 8000-8050"
   "multinode-demo/validator.sh \
-    $maybeNoLeaderRotation \
     --enable-rpc-exit \
     --no-restart \
-    --init-complete-file init-complete-node2.log \
+    --dynamic-port-range 8050-8100
+    --init-complete-file init-complete-node1.log \
     --rpc-port 18899"
 )
 
-for i in $(seq 1 $extraNodes); do
-  nodes+=(
-    "multinode-demo/validator.sh \
-      --no-restart \
-      --label dyn$i \
-      --init-complete-file init-complete-node$((2 + i)).log \
-      $maybeNoLeaderRotation"
-  )
-done
+if [[ extraNodes -gt 0 ]]; then
+  for i in $(seq 1 $extraNodes); do
+    portStart=$((8100 + i * 50))
+    portEnd=$((portStart + 49))
+    nodes+=(
+      "multinode-demo/validator.sh \
+        --no-restart \
+        --dynamic-port-range $portStart-$portEnd
+        --label dyn$i \
+        --init-complete-file init-complete-node$((1 + i)).log"
+    )
+  done
+fi
 numNodes=$((2 + extraNodes))
 
 pids=()
@@ -125,21 +125,26 @@ startNode() {
   echo "log: $log"
 }
 
+waitForNodeToInit() {
+  declare initCompleteFile=$1
+  while [[ ! -r $initCompleteFile ]]; do
+    if [[ $SECONDS -ge 240 ]]; then
+      echo "^^^ +++"
+      echo "Error: $initCompleteFile not found in $SECONDS seconds"
+      exit 1
+    fi
+    echo "Waiting for $initCompleteFile ($SECONDS)..."
+    sleep 2
+  done
+  echo "Found $initCompleteFile"
+}
+
 initCompleteFiles=()
 waitForAllNodesToInit() {
   echo "--- ${#initCompleteFiles[@]} nodes booting"
   SECONDS=
   for initCompleteFile in "${initCompleteFiles[@]}"; do
-    while [[ ! -r $initCompleteFile ]]; do
-      if [[ $SECONDS -ge 240 ]]; then
-        echo "^^^ +++"
-        echo "Error: $initCompleteFile not found in $SECONDS seconds"
-        exit 1
-      fi
-      echo "Waiting for $initCompleteFile ($SECONDS)..."
-      sleep 2
-    done
-    echo "Found $initCompleteFile"
+    waitForNodeToInit "$initCompleteFile"
   done
   echo "All nodes finished booting in $SECONDS seconds"
 }
@@ -150,17 +155,31 @@ startNodes() {
     addLogs=true
   fi
   initCompleteFiles=()
+  maybeExpectedGenesisHash=
   for i in $(seq 0 $((${#nodes[@]} - 1))); do
     declare cmd=${nodes[$i]}
 
-    if [[ "$i" -ne 0 ]]; then # 0 == drone, skip it
-      declare initCompleteFile="init-complete-node$i.log"
-      rm -f "$initCompleteFile"
-      initCompleteFiles+=("$initCompleteFile")
-    fi
-    startNode "$i" "$cmd"
+    declare initCompleteFile="init-complete-node$i.log"
+    rm -f "$initCompleteFile"
+    initCompleteFiles+=("$initCompleteFile")
+
+    startNode "$i" "$cmd $maybeExpectedGenesisHash"
     if $addLogs; then
       logs+=("$(getNodeLogFile "$i" "$cmd")")
+    fi
+
+    # 1 == bootstrap validator, wait until it boots before starting
+    # other validators
+    if [[ "$i" -eq 1 ]]; then
+      SECONDS=
+      waitForNodeToInit "$initCompleteFile"
+
+      (
+        set -x
+        $solana_cli --keypair config/bootstrap-validator/identity.json \
+          --url http://127.0.0.1:8899 genesis-hash
+      ) | tee genesis-hash.log
+      maybeExpectedGenesisHash="--expected-genesis-hash $(tail -n1 genesis-hash.log)"
     fi
   done
 
@@ -189,7 +208,7 @@ killNodes() {
       set -x
       curl --retry 5 --retry-delay 2 --retry-connrefused \
         -X POST -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","id":1, "method":"fullnodeExit"}' \
+        -d '{"jsonrpc":"2.0","id":1, "method":"validatorExit"}' \
         http://localhost:$port
     )
   done
@@ -222,8 +241,8 @@ rollingNodeRestart() {
     declare pid=${oldPids[$i]}
     declare cmd=${nodes[$i]}
     if [[ $i -eq 0 ]]; then
-      # First cmd should be the drone, don't restart it.
-      [[ "$cmd" = "multinode-demo/drone.sh" ]]
+      # First cmd should be the faucet, don't restart it.
+      [[ "$cmd" = "multinode-demo/faucet.sh" ]]
       pids+=("$pid")
     else
       echo "--- Restarting $pid: $cmd"
@@ -244,7 +263,7 @@ rollingNodeRestart() {
   # 'Atomically' remove the old pids from the pids array
   declare oldPidsList
   oldPidsList="$(printf ":%s" "${oldPids[@]}"):"
-  declare newPids=("${pids[0]}") # 0 = drone pid
+  declare newPids=("${pids[0]}") # 0 = faucet pid
   for pid in "${pids[@]}"; do
     [[ $oldPidsList =~ :$pid: ]] || {
       newPids+=("$pid")
@@ -256,12 +275,11 @@ rollingNodeRestart() {
 }
 
 verifyLedger() {
-  for ledger in bootstrap-leader validator; do
+  for ledger in bootstrap-validator validator; do
     echo "--- $ledger ledger verification"
     (
-      source multinode-demo/common.sh
       set -x
-      $solana_ledger_tool --ledger "$SOLANA_CONFIG_DIR"/$ledger-ledger verify
+      $solana_ledger_tool --ledger "$SOLANA_CONFIG_DIR"/$ledger verify
     ) || flag_error
   done
 }
@@ -294,25 +312,24 @@ flag_error() {
 }
 
 if ! $skipSetup; then
-  multinode-demo/setup.sh
+  clear_config_dir "$SOLANA_CONFIG_DIR"
+  multinode-demo/setup.sh --hashes-per-tick sleep
 else
   verifyLedger
 fi
 startNodes
 lastTransactionCount=
-enforceTransactionCountAdvance=true
 while [[ $iteration -le $iterations ]]; do
   echo "--- Node count ($iteration)"
   (
-    source multinode-demo/common.sh
     set -x
     client_keypair=/tmp/client-id.json-$$
-    $solana_keygen new -f -o $client_keypair || exit $?
-    $solana_gossip spy --num-nodes-exactly $numNodes || exit $?
+    $solana_keygen new --no-passphrase -fso $client_keypair || exit $?
+    $solana_gossip spy -n 127.0.0.1:8001 --num-nodes-exactly $numNodes || exit $?
     rm -rf $client_keypair
   ) || flag_error
 
-  echo "--- RPC API: bootstrap-leader getTransactionCount ($iteration)"
+  echo "--- RPC API: bootstrap-validator getTransactionCount ($iteration)"
   (
     set -x
     curl --retry 5 --retry-delay 2 --retry-connrefused \
@@ -332,40 +349,24 @@ while [[ $iteration -le $iterations ]]; do
       http://localhost:18899
   ) || flag_error
 
-  # Verify transaction count as reported by the bootstrap-leader node is advancing
+  # Verify transaction count as reported by the bootstrap-validator node is advancing
   transactionCount=$(sed -e 's/{"jsonrpc":"2.0","result":\([0-9]*\),"id":1}/\1/' log-transactionCount.txt)
   if [[ -n $lastTransactionCount ]]; then
     echo "--- Transaction count check: $lastTransactionCount < $transactionCount"
-    if $enforceTransactionCountAdvance; then
-      if [[ $lastTransactionCount -ge $transactionCount ]]; then
-        echo "Error: Transaction count is not advancing"
-        echo "* lastTransactionCount: $lastTransactionCount"
-        echo "* transactionCount: $transactionCount"
-        flag_error
-      fi
-    else
-      echo "enforceTransactionCountAdvance=false"
+    if [[ $lastTransactionCount -ge $transactionCount ]]; then
+      echo "Error: Transaction count is not advancing"
+      echo "* lastTransactionCount: $lastTransactionCount"
+      echo "* transactionCount: $transactionCount"
+      flag_error
     fi
-    enforceTransactionCountAdvance=true
   fi
   lastTransactionCount=$transactionCount
 
   echo "--- Wallet sanity ($iteration)"
-  flag_error_if_no_leader_rotation() {
-    # TODO: Stop ignoring wallet sanity failures when leader rotation is enabled
-    #       once https://github.com/solana-labs/solana/issues/2474 is fixed
-    if [[ -n $maybeNoLeaderRotation ]]; then
-      flag_error
-    else
-      # Wallet error occurred (and was ignored) so transactionCount may not
-      # advance on the next iteration
-      enforceTransactionCountAdvance=false
-    fi
-  }
   (
     set -x
     timeout 60s scripts/wallet-sanity.sh --url http://127.0.0.1"$walletRpcPort"
-  ) || flag_error_if_no_leader_rotation
+  ) || flag_error
 
   iteration=$((iteration + 1))
 

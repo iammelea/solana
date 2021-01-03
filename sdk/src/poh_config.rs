@@ -1,10 +1,13 @@
-use crate::timing::DEFAULT_NUM_TICKS_PER_SECOND;
+use crate::clock::DEFAULT_TICKS_PER_SECOND;
 use std::time::Duration;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, AbiExample)]
 pub struct PohConfig {
     /// The target tick rate of the cluster.
     pub target_tick_duration: Duration,
+
+    /// The target total tick count to be produced; used for testing only
+    pub target_tick_count: Option<u64>,
 
     /// How many hashes to roll before emitting the next tick entry.
     /// None enables "Low power mode", which implies:
@@ -18,12 +21,15 @@ impl PohConfig {
         Self {
             target_tick_duration,
             hashes_per_tick: None,
+            target_tick_count: None,
         }
     }
 }
 
 impl Default for PohConfig {
     fn default() -> Self {
-        Self::new_sleep(Duration::from_millis(1000 / DEFAULT_NUM_TICKS_PER_SECOND))
+        Self::new_sleep(Duration::from_micros(
+            1000 * 1000 / DEFAULT_TICKS_PER_SECOND,
+        ))
     }
 }

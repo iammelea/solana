@@ -1,13 +1,11 @@
 //! The `result` module exposes a Result type that propagates one of many different Error types.
 
-use crate::blocktree;
 use crate::cluster_info;
-use crate::packet;
 use crate::poh_recorder;
-use bincode;
-use serde_json;
+use solana_ledger::block_error;
+use solana_ledger::blockstore;
+use solana_runtime::snapshot_utils;
 use solana_sdk::transaction;
-use std;
 use std::any::Any;
 
 #[derive(Debug)]
@@ -17,16 +15,24 @@ pub enum Error {
     AddrParse(std::net::AddrParseError),
     JoinError(Box<dyn Any + Send + 'static>),
     RecvError(std::sync::mpsc::RecvError),
+    TryCrossbeamRecvError(crossbeam_channel::TryRecvError),
+    CrossbeamRecvTimeoutError(crossbeam_channel::RecvTimeoutError),
+    ReadyTimeoutError,
     RecvTimeoutError(std::sync::mpsc::RecvTimeoutError),
+    CrossbeamSendError,
+    TryCrossbeamSendError,
     TryRecvError(std::sync::mpsc::TryRecvError),
     Serialize(std::boxed::Box<bincode::ErrorKind>),
     TransactionError(transaction::TransactionError),
     ClusterInfoError(cluster_info::ClusterInfoError),
-    BlobError(packet::BlobError),
-    ErasureError(reed_solomon_erasure::Error),
     SendError,
     PohRecorderError(poh_recorder::PohRecorderError),
-    BlocktreeError(blocktree::BlocktreeError),
+    BlockError(block_error::BlockError),
+    BlockstoreError(blockstore::BlockstoreError),
+    FsExtra(fs_extra::error::Error),
+    SnapshotError(snapshot_utils::SnapshotError),
+    WeightedIndexError(rand::distributions::weighted::WeightedError),
+    DuplicateNodeInstance,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -44,9 +50,24 @@ impl std::convert::From<std::sync::mpsc::RecvError> for Error {
         Error::RecvError(e)
     }
 }
+impl std::convert::From<crossbeam_channel::TryRecvError> for Error {
+    fn from(e: crossbeam_channel::TryRecvError) -> Error {
+        Error::TryCrossbeamRecvError(e)
+    }
+}
 impl std::convert::From<std::sync::mpsc::TryRecvError> for Error {
     fn from(e: std::sync::mpsc::TryRecvError) -> Error {
         Error::TryRecvError(e)
+    }
+}
+impl std::convert::From<crossbeam_channel::RecvTimeoutError> for Error {
+    fn from(e: crossbeam_channel::RecvTimeoutError) -> Error {
+        Error::CrossbeamRecvTimeoutError(e)
+    }
+}
+impl std::convert::From<crossbeam_channel::ReadyTimeoutError> for Error {
+    fn from(_e: crossbeam_channel::ReadyTimeoutError) -> Error {
+        Error::ReadyTimeoutError
     }
 }
 impl std::convert::From<std::sync::mpsc::RecvTimeoutError> for Error {
@@ -64,9 +85,14 @@ impl std::convert::From<cluster_info::ClusterInfoError> for Error {
         Error::ClusterInfoError(e)
     }
 }
-impl std::convert::From<reed_solomon_erasure::Error> for Error {
-    fn from(e: reed_solomon_erasure::Error) -> Error {
-        Error::ErasureError(e)
+impl<T> std::convert::From<crossbeam_channel::SendError<T>> for Error {
+    fn from(_e: crossbeam_channel::SendError<T>) -> Error {
+        Error::CrossbeamSendError
+    }
+}
+impl<T> std::convert::From<crossbeam_channel::TrySendError<T>> for Error {
+    fn from(_e: crossbeam_channel::TrySendError<T>) -> Error {
+        Error::TryCrossbeamSendError
     }
 }
 impl<T> std::convert::From<std::sync::mpsc::SendError<T>> for Error {
@@ -82,6 +108,11 @@ impl std::convert::From<Box<dyn Any + Send + 'static>> for Error {
 impl std::convert::From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
         Error::IO(e)
+    }
+}
+impl std::convert::From<fs_extra::error::Error> for Error {
+    fn from(e: fs_extra::error::Error) -> Error {
+        Error::FsExtra(e)
     }
 }
 impl std::convert::From<serde_json::Error> for Error {
@@ -104,9 +135,19 @@ impl std::convert::From<poh_recorder::PohRecorderError> for Error {
         Error::PohRecorderError(e)
     }
 }
-impl std::convert::From<blocktree::BlocktreeError> for Error {
-    fn from(e: blocktree::BlocktreeError) -> Error {
-        Error::BlocktreeError(e)
+impl std::convert::From<blockstore::BlockstoreError> for Error {
+    fn from(e: blockstore::BlockstoreError) -> Error {
+        Error::BlockstoreError(e)
+    }
+}
+impl std::convert::From<snapshot_utils::SnapshotError> for Error {
+    fn from(e: snapshot_utils::SnapshotError) -> Error {
+        Error::SnapshotError(e)
+    }
+}
+impl std::convert::From<rand::distributions::weighted::WeightedError> for Error {
+    fn from(e: rand::distributions::weighted::WeightedError) -> Error {
+        Error::WeightedIndexError(e)
     }
 }
 
@@ -114,7 +155,6 @@ impl std::convert::From<blocktree::BlocktreeError> for Error {
 mod tests {
     use crate::result::Error;
     use crate::result::Result;
-    use serde_json;
     use std::io;
     use std::io::Write;
     use std::net::SocketAddr;
@@ -125,18 +165,15 @@ mod tests {
     use std::thread;
 
     fn addr_parse_error() -> Result<SocketAddr> {
-        let r = "12fdfasfsafsadfs".parse()?;
-        Ok(r)
+        Ok("12fdfasfsafsadfs".parse()?)
     }
 
     fn join_error() -> Result<()> {
         panic::set_hook(Box::new(|_info| {}));
-        let r = thread::spawn(|| panic!("hi")).join()?;
-        Ok(r)
+        Ok(thread::spawn(|| panic!("hi")).join()?)
     }
     fn json_error() -> Result<()> {
-        let r = serde_json::from_slice("=342{;;;;:}".as_bytes())?;
-        Ok(r)
+        Ok(serde_json::from_slice(b"=342{;;;;:}")?)
     }
     fn send_error() -> Result<()> {
         let (s, r) = channel();

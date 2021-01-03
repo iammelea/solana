@@ -7,9 +7,8 @@
 # shellcheck disable=2034
 #
 
-SOLANA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. || exit 1; pwd)"
-
-rsync=rsync
+# shellcheck source=net/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. || exit 1; pwd)"/net/common.sh
 
 if [[ $(uname) != Linux ]]; then
   # Protect against unsupported configurations to prevent non-obvious errors
@@ -20,57 +19,48 @@ if [[ $(uname) != Linux ]]; then
   fi
 fi
 
-if [[ -f "$SOLANA_ROOT"/target/perf-libs/env.sh ]]; then
-  # shellcheck source=/dev/null
-  source "$SOLANA_ROOT"/target/perf-libs/env.sh
-fi
-
 if [[ -n $USE_INSTALL || ! -f "$SOLANA_ROOT"/Cargo.toml ]]; then
   solana_program() {
     declare program="$1"
-    printf "solana-%s" "$program"
+    if [[ -z $program ]]; then
+      printf "solana"
+    else
+      printf "solana-%s" "$program"
+    fi
   }
 else
   solana_program() {
     declare program="$1"
-    declare features="--features="
-    if [[ "$program" =~ ^(.*)-cuda$ ]]; then
-      program=${BASH_REMATCH[1]}
-      features+="cuda"
+    declare crate="$program"
+    if [[ -z $program ]]; then
+      crate="cli"
+      program="solana"
+    else
+      program="solana-$program"
     fi
-    if [[ -r "$SOLANA_ROOT/$program"/Cargo.toml ]]; then
-      maybe_package="--package solana-$program"
+
+    if [[ -r "$SOLANA_ROOT/$crate"/Cargo.toml ]]; then
+      maybe_package="--package solana-$crate"
     fi
     if [[ -n $NDEBUG ]]; then
       maybe_release=--release
     fi
-    declare manifest_path="--manifest-path=$SOLANA_ROOT/$program/Cargo.toml"
-    printf "cargo run $manifest_path $maybe_release $maybe_package --bin solana-%s %s -- " "$program" "$features"
+    declare manifest_path="--manifest-path=$SOLANA_ROOT/$crate/Cargo.toml"
+    printf "cargo $CARGO_TOOLCHAIN run $manifest_path $maybe_release $maybe_package --bin %s %s -- " "$program"
   }
 fi
 
 solana_bench_tps=$(solana_program bench-tps)
-solana_drone=$(solana_program drone)
+solana_faucet=$(solana_program faucet)
 solana_validator=$(solana_program validator)
-solana_validator_cuda=$(solana_program validator-cuda)
+solana_validator_cuda="$solana_validator --cuda"
 solana_genesis=$(solana_program genesis)
 solana_gossip=$(solana_program gossip)
 solana_keygen=$(solana_program keygen)
 solana_ledger_tool=$(solana_program ledger-tool)
-solana_wallet=$(solana_program wallet)
-solana_replicator=$(solana_program replicator)
+solana_cli=$(solana_program)
 
-export RUST_LOG=${RUST_LOG:-solana=info} # if RUST_LOG is unset, default to info
 export RUST_BACKTRACE=1
-
-# shellcheck source=scripts/configure-metrics.sh
-source "$SOLANA_ROOT"/scripts/configure-metrics.sh
-
-# The directory on the cluster entrypoint that is rsynced by other full nodes
-SOLANA_RSYNC_CONFIG_DIR=$SOLANA_ROOT/config
-
-# Configuration that remains local
-SOLANA_CONFIG_DIR=$SOLANA_ROOT/config-local
 
 default_arg() {
   declare name=$1
@@ -87,4 +77,19 @@ default_arg() {
   else
     args+=("$name")
   fi
+}
+
+replace_arg() {
+  declare name=$1
+  declare value=$2
+
+  default_arg "$name" "$value"
+
+  declare index=0
+  for arg in "${args[@]}"; do
+    index=$((index + 1))
+    if [[ $arg = "$name" ]]; then
+      args[$index]="$value"
+    fi
+  done
 }

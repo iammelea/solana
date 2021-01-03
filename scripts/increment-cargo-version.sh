@@ -6,7 +6,9 @@ usage() {
 usage: $0 [major|minor|patch|-preXYZ]
 
 Increments the Cargo.toml version.
-A minor version increment is the default
+
+Default:
+* Removes the prerelease tag if present, otherwise the minor version is incremented.
 EOF
   exit 0
 }
@@ -14,22 +16,24 @@ EOF
 here="$(dirname "$0")"
 cd "$here"/..
 source ci/semver_bash/semver.sh
+source scripts/read-cargo-variable.sh
 
-readCargoVariable() {
-  declare variable="$1"
-  declare Cargo_toml="$2"
+ignores=(
+  .cache
+  .cargo
+  target
+  web3.js/examples
+)
 
-  while read -r name equals value _; do
-    if [[ $name = "$variable" && $equals = = ]]; then
-      echo "${value//\"/}"
-      return
-    fi
-  done < <(cat "$Cargo_toml")
-  echo "Unable to locate $variable in $Cargo_toml" 1>&2
-}
+not_paths=()
+for ignore in "${ignores[@]}"; do
+  not_paths+=(-not -path "*/$ignore/*")
+done
 
+# shellcheck disable=2207,SC2068 # Don't want a positional arg if `not-paths` is empty
+Cargo_tomls=($(find . -mindepth 2 -name Cargo.toml ${not_paths[@]}))
 # shellcheck disable=2207
-Cargo_tomls=($(find . -name Cargo.toml))
+markdownFiles=($(find . -name "*.md"))
 
 # Collect the name of all the internal crates
 crates=()
@@ -46,19 +50,46 @@ SPECIAL=""
 semverParseInto "$(readCargoVariable version "${Cargo_tomls[0]}")" MAJOR MINOR PATCH SPECIAL
 [[ -n $MAJOR ]] || usage
 
-currentVersion="$MAJOR.$MINOR.$PATCH$SPECIAL"
+currentVersion="$MAJOR\.$MINOR\.$PATCH$SPECIAL"
+
+bump=$1
+if [[ -z $bump ]]; then
+  if [[ -n $SPECIAL ]]; then
+    bump=dropspecial # Remove prerelease tag
+  else
+    bump=minor
+  fi
+fi
 SPECIAL=""
 
 # Figure out what to increment
-case ${1:-minor} in
+case $bump in
 patch)
   PATCH=$((PATCH + 1))
   ;;
 major)
   MAJOR=$((MAJOR+ 1))
+  MINOR=0
+  PATCH=0
   ;;
 minor)
   MINOR=$((MINOR+ 1))
+  PATCH=0
+  ;;
+dropspecial)
+  ;;
+check)
+  badTomls=()
+  for Cargo_toml in "${Cargo_tomls[@]}"; do
+    if ! grep "^version *= *\"$currentVersion\"$" "$Cargo_toml" &>/dev/null; then
+      badTomls+=("$Cargo_toml")
+    fi
+  done
+  if [[ ${#badTomls[@]} -ne 0 ]]; then
+    echo "Error: Incorrect crate version specified in: ${badTomls[*]}"
+    exit 1
+  fi
+  exit 0
   ;;
 -*)
   if [[ $1 =~ ^-[A-Za-z0-9]*$ ]]; then
@@ -81,7 +112,7 @@ for Cargo_toml in "${Cargo_tomls[@]}"; do
   # Set new crate version
   (
     set -x
-    sed -i "$Cargo_toml" -e "s/^version = \"[^\"]*\"$/version = \"$newVersion\"/"
+    sed -i "$Cargo_toml" -e "0,/^version =/{s/^version = \"[^\"]*\"$/version = \"$newVersion\"/}"
   )
 
   # Fix up the version references to other internal crates
@@ -93,6 +124,15 @@ for Cargo_toml in "${Cargo_tomls[@]}"; do
       "
     )
   done
+done
+
+# Update all the documentation references
+for file in "${markdownFiles[@]}"; do
+  # Set new crate version
+  (
+    set -x
+    sed -i "$file" -e "s/$currentVersion/$newVersion/g"
+  )
 done
 
 echo "$currentVersion -> $newVersion"

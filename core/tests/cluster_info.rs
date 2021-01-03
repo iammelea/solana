@@ -1,9 +1,8 @@
-use rand::SeedableRng;
-use rand_chacha::ChaChaRng;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
-use solana::cluster_info::{compute_retransmit_peers, ClusterInfo};
-use solana::contact_info::ContactInfo;
+use serial_test_derive::serial;
+use solana_core::cluster_info::{compute_retransmit_peers, ClusterInfo};
+use solana_core::contact_info::ContactInfo;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::channel;
@@ -16,14 +15,14 @@ use std::time::Instant;
 type Nodes = HashMap<Pubkey, (bool, HashSet<i32>, Receiver<(i32, bool)>)>;
 
 fn num_threads() -> usize {
-    sys_info::cpu_num().unwrap_or(10) as usize
+    num_cpus::get()
 }
 
 /// Search for the a node with the given balance
-fn find_insert_blob(id: &Pubkey, blob: i32, batches: &mut [Nodes]) {
+fn find_insert_shred(id: &Pubkey, shred: i32, batches: &mut [Nodes]) {
     batches.par_iter_mut().for_each(|batch| {
         if batch.contains_key(id) {
-            let _ = batch.get_mut(id).unwrap().1.insert(blob);
+            let _ = batch.get_mut(id).unwrap().1.insert(shred);
         }
     });
 }
@@ -33,7 +32,7 @@ fn retransmit(
     senders: &HashMap<Pubkey, Sender<(i32, bool)>>,
     cluster: &ClusterInfo,
     fanout: usize,
-    blob: i32,
+    shred: i32,
     retransmit: bool,
 ) -> i32 {
     let mut seed = [0; 32];
@@ -48,31 +47,33 @@ fn retransmit(
             true
         }
     });
-    seed[0..4].copy_from_slice(&blob.to_le_bytes());
-    let (neighbors, children) = compute_retransmit_peers(fanout, my_index, shuffled_nodes);
-    children.iter().for_each(|p| {
-        let s = senders.get(&p.id).unwrap();
-        let _ = s.send((blob, retransmit));
+    seed[0..4].copy_from_slice(&shred.to_le_bytes());
+    let shuffled_indices = (0..shuffled_nodes.len()).collect();
+    let (neighbors, children) = compute_retransmit_peers(fanout, my_index, shuffled_indices);
+    children.into_iter().for_each(|i| {
+        let s = senders.get(&shuffled_nodes[i].id).unwrap();
+        let _ = s.send((shred, retransmit));
     });
 
     if retransmit {
-        neighbors.iter().for_each(|p| {
-            let s = senders.get(&p.id).unwrap();
-            let _ = s.send((blob, false));
+        neighbors.into_iter().for_each(|i| {
+            let s = senders.get(&shuffled_nodes[i].id).unwrap();
+            let _ = s.send((shred, false));
         });
     }
 
-    blob
+    shred
 }
 
+#[allow(clippy::type_complexity)]
 fn run_simulation(stakes: &[u64], fanout: usize) {
     let num_threads = num_threads();
     // set timeout to 5 minutes
     let timeout = 60 * 5;
 
     // describe the leader
-    let leader_info = ContactInfo::new_localhost(&Pubkey::new_rand(), 0);
-    let mut cluster_info = ClusterInfo::new_with_invalid_keypair(leader_info.clone());
+    let leader_info = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
+    let cluster_info = ClusterInfo::new_with_invalid_keypair(leader_info.clone());
 
     // setup staked nodes
     let mut staked_nodes = HashMap::new();
@@ -91,10 +92,10 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
     let range: Vec<_> = (1..=stakes.len()).collect();
     let chunk_size = (stakes.len() + num_threads - 1) / num_threads;
     range.chunks(chunk_size).for_each(|chunk| {
-        chunk.into_iter().for_each(|i| {
+        chunk.iter().for_each(|i| {
             //distribute neighbors across threads to maximize parallel compute
             let batch_ix = *i as usize % batches.len();
-            let node = ContactInfo::new_localhost(&Pubkey::new_rand(), 0);
+            let node = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0);
             staked_nodes.insert(node.id, stakes[*i - 1]);
             cluster_info.insert_info(node.clone());
             let (s, r) = channel();
@@ -105,23 +106,33 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
             senders.lock().unwrap().insert(node.id, s);
         })
     });
-    let c_info = cluster_info.clone();
+    let c_info = cluster_info.clone_with_id(&cluster_info.id());
 
-    let blobs_len = 100;
-    let shuffled_peers: Vec<Vec<ContactInfo>> = (0..blobs_len as i32)
+    let staked_nodes = Arc::new(staked_nodes);
+    let shreds_len = 100;
+    let shuffled_peers: Vec<Vec<ContactInfo>> = (0..shreds_len as i32)
         .map(|i| {
             let mut seed = [0; 32];
             seed[0..4].copy_from_slice(&i.to_le_bytes());
-            let (_, peers) = cluster_info
-                .shuffle_peers_and_index(Some(&staked_nodes), ChaChaRng::from_seed(seed));
-            peers
+            let (peers, stakes_and_index) =
+                cluster_info.sorted_retransmit_peers_and_stakes(Some(staked_nodes.clone()));
+            let (_, shuffled_stakes_and_indexes) = ClusterInfo::shuffle_peers_and_index(
+                &cluster_info.id(),
+                &peers,
+                &stakes_and_index,
+                seed,
+            );
+            shuffled_stakes_and_indexes
+                .into_iter()
+                .map(|(_, i)| peers[i].clone())
+                .collect()
         })
         .collect();
 
-    // create some "blobs".
-    (0..blobs_len).into_iter().for_each(|i| {
+    // create some "shreds".
+    (0..shreds_len).for_each(|i| {
         let broadcast_table = &shuffled_peers[i];
-        find_insert_blob(&broadcast_table[0].id, i as i32, &mut batches);
+        find_insert_shred(&broadcast_table[0].id, i as i32, &mut batches);
     });
 
     assert!(!batches.is_empty());
@@ -129,7 +140,6 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
     // start turbine simulation
     let now = Instant::now();
     batches.par_iter_mut().for_each(|batch| {
-        let mut cluster = c_info.clone();
         let mut remaining = batch.len();
         let senders: HashMap<_, _> = senders.lock().unwrap().clone();
         while remaining > 0 {
@@ -139,7 +149,7 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
                     "Timed out with {:?} remaining nodes",
                     remaining
                 );
-                cluster.gossip.set_self(&*id);
+                let cluster = c_info.clone_with_id(id);
                 if !*layer1_done {
                     recv.iter().for_each(|i| {
                         retransmit(
@@ -155,7 +165,7 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
                 }
 
                 //send and recv
-                if recv.len() < blobs_len {
+                if recv.len() < shreds_len {
                     loop {
                         match r.try_recv() {
                             Ok((data, retx)) => {
@@ -169,7 +179,7 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
                                         retx,
                                     );
                                 }
-                                if recv.len() == blobs_len {
+                                if recv.len() == shreds_len {
                                     remaining -= 1;
                                     break;
                                 }
@@ -190,21 +200,24 @@ fn run_simulation(stakes: &[u64], fanout: usize) {
 
 // Run with a single layer
 #[test]
+#[serial]
 fn test_retransmit_small() {
-    let stakes: Vec<_> = (0..200).map(|i| i).collect();
+    let stakes: Vec<_> = (0..200).collect();
     run_simulation(&stakes, 200);
 }
 
 // Make sure at least 2 layers are used
 #[test]
+#[serial]
 fn test_retransmit_medium() {
     let num_nodes = 2000;
-    let stakes: Vec<_> = (0..num_nodes).map(|i| i).collect();
+    let stakes: Vec<_> = (0..num_nodes).collect();
     run_simulation(&stakes, 200);
 }
 
 // Make sure at least 2 layers are used but with equal stakes
 #[test]
+#[serial]
 fn test_retransmit_medium_equal_stakes() {
     let num_nodes = 2000;
     let stakes: Vec<_> = (0..num_nodes).map(|_| 10).collect();
@@ -213,8 +226,9 @@ fn test_retransmit_medium_equal_stakes() {
 
 // Scale down the network and make sure many layers are used
 #[test]
+#[serial]
 fn test_retransmit_large() {
     let num_nodes = 4000;
-    let stakes: Vec<_> = (0..num_nodes).map(|i| i).collect();
+    let stakes: Vec<_> = (0..num_nodes).collect();
     run_simulation(&stakes, 2);
 }

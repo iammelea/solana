@@ -3,18 +3,20 @@
 extern crate test;
 use bv::BitVec;
 use fnv::FnvHasher;
-use solana_runtime::bloom::{Bloom, BloomHashIndex};
-use solana_sdk::hash::{hash, Hash};
-use solana_sdk::signature::Signature;
-//use std::collections::HashSet;
-use hashbrown::HashSet;
+use rand::Rng;
+use solana_runtime::bloom::{AtomicBloom, Bloom, BloomHashIndex};
+use solana_sdk::{
+    hash::{hash, Hash},
+    signature::Signature,
+};
+use std::collections::HashSet;
 use std::hash::Hasher;
 use test::Bencher;
 
 #[bench]
 #[ignore]
 fn bench_bits_set(bencher: &mut Bencher) {
-    let mut bits: BitVec<u8> = BitVec::new_fill(false, 38_340_234 as u64);
+    let mut bits: BitVec<u8> = BitVec::new_fill(false, 38_340_234_u64);
     let mut hasher = FnvHasher::default();
 
     bencher.iter(|| {
@@ -29,7 +31,7 @@ fn bench_bits_set(bencher: &mut Bencher) {
 #[bench]
 #[ignore]
 fn bench_bits_set_hasher(bencher: &mut Bencher) {
-    let bits: BitVec<u8> = BitVec::new_fill(false, 38_340_234 as u64);
+    let bits: BitVec<u8> = BitVec::new_fill(false, 38_340_234_u64);
     let mut hasher = FnvHasher::default();
 
     bencher.iter(|| {
@@ -46,10 +48,7 @@ fn bench_sigs_bloom(bencher: &mut Bencher) {
     // https://hur.st/bloomfilter/?n=1000000&p=1.0E-8&m=&k=
     let blockhash = hash(Hash::default().as_ref());
     //    info!("blockhash = {:?}", blockhash);
-    let keys = (0..27)
-        .into_iter()
-        .map(|i| blockhash.hash_at_index(i))
-        .collect();
+    let keys = (0..27).map(|i| blockhash.hash_at_index(i)).collect();
     let mut sigs: Bloom<Signature> = Bloom::new(38_340_234, keys);
 
     let mut id = blockhash;
@@ -98,4 +97,48 @@ fn bench_sigs_hashmap(bencher: &mut Bencher) {
         iterations += 1;
     });
     assert_eq!(falses, 0);
+}
+
+#[bench]
+fn bench_add_hash(bencher: &mut Bencher) {
+    let mut rng = rand::thread_rng();
+    let hash_values: Vec<_> = std::iter::repeat_with(|| solana_sdk::hash::new_rand(&mut rng))
+        .take(1200)
+        .collect();
+    let mut fail = 0;
+    bencher.iter(|| {
+        let mut bloom = Bloom::random(1287, 0.1, 7424);
+        for hash_value in &hash_values {
+            bloom.add(hash_value);
+        }
+        let index = rng.gen_range(0, hash_values.len());
+        if !bloom.contains(&hash_values[index]) {
+            fail += 1;
+        }
+    });
+    assert_eq!(fail, 0);
+}
+
+#[bench]
+fn bench_add_hash_atomic(bencher: &mut Bencher) {
+    let mut rng = rand::thread_rng();
+    let hash_values: Vec<_> = std::iter::repeat_with(|| solana_sdk::hash::new_rand(&mut rng))
+        .take(1200)
+        .collect();
+    let mut fail = 0;
+    bencher.iter(|| {
+        let bloom: AtomicBloom<_> = Bloom::random(1287, 0.1, 7424).into();
+        // Intentionally not using parallelism here, so that this and above
+        // benchmark only compare the bit-vector ops.
+        // For benchmarking the parallel code, change bellow for loop to:
+        //     hash_values.par_iter().for_each(|v| bloom.add(v));
+        for hash_value in &hash_values {
+            bloom.add(hash_value);
+        }
+        let index = rng.gen_range(0, hash_values.len());
+        if !bloom.contains(&hash_values[index]) {
+            fail += 1;
+        }
+    });
+    assert_eq!(fail, 0);
 }

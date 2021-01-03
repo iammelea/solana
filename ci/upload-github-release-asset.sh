@@ -23,10 +23,14 @@ if [[ -z $CI_TAG ]]; then
   exit 1
 fi
 
-if [[ -z $CI_REPO_SLUG ]]; then
-  echo Error: CI_REPO_SLUG not defined
-  exit 1
-fi
+# Force CI_REPO_SLUG since sometimes
+# BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG is not set correctly, causing the
+# artifact upload to fail
+CI_REPO_SLUG=solana-labs/solana
+#if [[ -z $CI_REPO_SLUG ]]; then
+#  echo Error: CI_REPO_SLUG not defined
+#  exit 1
+#fi
 
 releaseId=$( \
   curl -s "https://api.github.com/repos/$CI_REPO_SLUG/releases/tags/$CI_TAG" \
@@ -38,6 +42,7 @@ echo "Github release id for $CI_TAG is $releaseId"
 for file in "$@"; do
   echo "--- Uploading $file to tag $CI_TAG of $CI_REPO_SLUG"
   curl \
+    --verbose \
     --data-binary @"$file" \
     -H "Authorization: token $GITHUB_TOKEN" \
     -H "Content-Type: application/octet-stream" \

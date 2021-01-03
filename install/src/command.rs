@@ -1,29 +1,44 @@
-use crate::config::Config;
-use crate::update_manifest::{SignedUpdateManifest, UpdateManifest};
+use crate::{
+    config::{Config, ExplicitRelease},
+    stop_process::stop_process,
+    update_manifest::{SignedUpdateManifest, UpdateManifest},
+};
 use chrono::{Local, TimeZone};
 use console::{style, Emoji};
 use indicatif::{ProgressBar, ProgressStyle};
-use ring::digest::{Context, Digest, SHA256};
+use serde_derive::Deserialize;
 use solana_client::rpc_client::RpcClient;
-use solana_config_api::config_instruction;
-use solana_sdk::message::Message;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{read_keypair, Keypair, KeypairUtil, Signable};
-use solana_sdk::transaction::Transaction;
-use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
-use std::thread::sleep;
-use std::time::SystemTime;
-use std::time::{Duration, Instant};
-use tempdir::TempDir;
+use solana_config_program::{config_instruction, get_config_data, ConfigState};
+use solana_sdk::{
+    hash::{Hash, Hasher},
+    message::Message,
+    pubkey::Pubkey,
+    signature::{read_keypair_file, Keypair, Signable, Signer},
+    transaction::Transaction,
+};
+use std::{
+    fs::{self, File},
+    io::{self, BufReader, Read},
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::{Duration, Instant, SystemTime},
+};
+use tempfile::TempDir;
 use url::Url;
+
+#[derive(Deserialize, Debug)]
+pub struct ReleaseVersion {
+    pub target: String,
+    pub commit: String,
+    channel: String,
+}
 
 static TRUCK: Emoji = Emoji("🚚 ", "");
 static LOOKING_GLASS: Emoji = Emoji("🔍 ", "");
 static BULLET: Emoji = Emoji("• ", "* ");
 static SPARKLE: Emoji = Emoji("✨ ", "");
 static PACKAGE: Emoji = Emoji("📦 ", "");
+static INFORMATION: Emoji = Emoji("ℹ️  ", "");
 
 /// Creates a new process bar for processing that will take an unknown amount of time
 fn new_spinner_progress_bar() -> ProgressBar {
@@ -39,50 +54,45 @@ fn println_name_value(name: &str, value: &str) {
     println!("{} {}", style(name).bold(), value);
 }
 
-/// Downloads the release archive at `url` to a temporary location.  If `expected_sha256` is
-/// Some(_), produce an error if the release SHA256 doesn't match.
+/// Downloads a file at `url` to a temporary location.  If `expected_sha256` is
+/// Some(_), produce an error if the SHA256 of the file contents doesn't match.
 ///
 /// Returns a tuple consisting of:
 /// * TempDir - drop this value to clean up the temporary location
-/// * PathBuf - path to the downloaded release (within `TempDir`)
+/// * PathBuf - path to the downloaded file (within `TempDir`)
 /// * String  - SHA256 of the release
 ///
-fn download_to_temp_archive(
+fn download_to_temp(
     url: &str,
-    expected_sha256: Option<&str>,
-) -> Result<(TempDir, PathBuf, String), Box<dyn std::error::Error>> {
-    fn sha256_digest<R: Read>(mut reader: R) -> Result<Digest, Box<dyn std::error::Error>> {
-        let mut context = Context::new(&SHA256);
-        let mut buffer = [0; 1024];
+    expected_sha256: Option<&Hash>,
+) -> Result<(TempDir, PathBuf, Hash), Box<dyn std::error::Error>> {
+    fn sha256_file_digest<P: AsRef<Path>>(path: P) -> Result<Hash, Box<dyn std::error::Error>> {
+        let input = File::open(path)?;
+        let mut reader = BufReader::new(input);
+        let mut hasher = Hasher::default();
 
+        let mut buffer = [0; 1024];
         loop {
             let count = reader.read(&mut buffer)?;
             if count == 0 {
                 break;
             }
-            context.update(&buffer[..count]);
+            hasher.hash(&buffer[..count]);
         }
-
-        Ok(context.finish())
-    }
-
-    fn sha256_file_digest<P: AsRef<Path>>(path: P) -> Result<Digest, Box<dyn std::error::Error>> {
-        let input = File::open(path)?;
-        let reader = BufReader::new(input);
-        sha256_digest(reader)
+        Ok(hasher.result())
     }
 
     let url = Url::parse(url).map_err(|err| format!("Unable to parse {}: {}", url, err))?;
 
-    let temp_dir = TempDir::new(clap::crate_name!())?;
-    let temp_file = temp_dir.path().join("release.tar.bz2");
+    let temp_dir = TempDir::new()?;
+    let temp_file = temp_dir.path().join("download");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::blocking::Client::new();
 
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message(&format!("{}Downloading...", TRUCK));
 
-    let response = client.get(url).send()?;
+    let response = client.get(url.as_str()).send()?;
     let download_size = {
         response
             .headers()
@@ -128,11 +138,12 @@ fn download_to_temp_archive(
 
     let temp_file_sha256 = sha256_file_digest(&temp_file)
         .map_err(|err| format!("Unable to hash {:?}: {}", temp_file, err))?;
-    let temp_file_sha256 = bs58::encode(temp_file_sha256).into_string();
 
     if expected_sha256.is_some() && expected_sha256 != Some(&temp_file_sha256) {
-        Err(io::Error::new(io::ErrorKind::Other, "Incorrect hash"))?;
+        return Err(io::Error::new(io::ErrorKind::Other, "Incorrect hash").into());
     }
+
+    source.progress_bar.finish_and_clear();
     Ok((temp_dir, temp_file, temp_file_sha256))
 }
 
@@ -159,22 +170,21 @@ fn extract_release_archive(
     Ok(())
 }
 
-/// Reads the supported TARGET triple for the given release
-fn load_release_target(release_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    use serde_derive::Deserialize;
-    #[derive(Deserialize, Debug)]
-    pub struct ReleaseVersion {
-        pub target: String,
-        pub commit: String,
-        channel: String,
-    }
+fn load_release_version(version_yml: &Path) -> Result<ReleaseVersion, String> {
+    let file = File::open(&version_yml)
+        .map_err(|err| format!("Unable to open {:?}: {:?}", version_yml, err))?;
+    let version: ReleaseVersion = serde_yaml::from_reader(file)
+        .map_err(|err| format!("Unable to parse {:?}: {:?}", version_yml, err))?;
+    Ok(version)
+}
 
+/// Reads the supported TARGET triple for the given release
+fn load_release_target(release_dir: &Path) -> Result<String, String> {
     let mut version_yml = PathBuf::from(release_dir);
     version_yml.push("solana-release");
     version_yml.push("version.yml");
 
-    let file = File::open(&version_yml)?;
-    let version: ReleaseVersion = serde_yaml::from_reader(file)?;
+    let version = load_release_version(&version_yml)?;
     Ok(version.target)
 }
 
@@ -199,15 +209,19 @@ fn new_update_manifest(
     {
         let (recent_blockhash, _fee_calculator) = rpc_client.get_recent_blockhash()?;
 
-        let new_account = config_instruction::create_account::<SignedUpdateManifest>(
+        let lamports = rpc_client
+            .get_minimum_balance_for_rent_exemption(SignedUpdateManifest::max_space() as usize)?;
+
+        let instructions = config_instruction::create_account::<SignedUpdateManifest>(
             &from_keypair.pubkey(),
             &update_manifest_keypair.pubkey(),
-            1, // lamports
+            lamports,
+            vec![], // additional keys
         );
-        let mut transaction = Transaction::new_unsigned_instructions(vec![new_account]);
-        transaction.sign(&[from_keypair], recent_blockhash);
-
-        rpc_client.send_and_confirm_transaction(&mut transaction, &[from_keypair])?;
+        let message = Message::new(&instructions, Some(&from_keypair.pubkey()));
+        let signers = [from_keypair, update_manifest_keypair];
+        let transaction = Transaction::new(&signers, message, recent_blockhash);
+        rpc_client.send_and_confirm_transaction(&transaction)?;
     }
     Ok(())
 }
@@ -224,12 +238,14 @@ fn store_update_manifest(
     let signers = [from_keypair, update_manifest_keypair];
     let instruction = config_instruction::store::<SignedUpdateManifest>(
         &update_manifest_keypair.pubkey(),
+        true,   // update_manifest_keypair is signer
+        vec![], // additional keys
         update_manifest,
     );
 
-    let message = Message::new_with_payer(vec![instruction], Some(&from_keypair.pubkey()));
-    let mut transaction = Transaction::new(&signers, message, recent_blockhash);
-    rpc_client.send_and_confirm_transaction(&mut transaction, &[from_keypair])?;
+    let message = Message::new(&[instruction], Some(&from_keypair.pubkey()));
+    let transaction = Transaction::new(&signers, message, recent_blockhash);
+    rpc_client.send_and_confirm_transaction(&transaction)?;
     Ok(())
 }
 
@@ -242,8 +258,10 @@ fn get_update_manifest(
         .get_account_data(update_manifest_pubkey)
         .map_err(|err| format!("Unable to fetch update manifest: {}", err))?;
 
+    let config_data = get_config_data(&data)
+        .map_err(|err| format!("Unable to get at config_data to update manifest: {}", err))?;
     let signed_update_manifest =
-        SignedUpdateManifest::deserialize(update_manifest_pubkey, &data)
+        SignedUpdateManifest::deserialize(update_manifest_pubkey, config_data)
             .map_err(|err| format!("Unable to deserialize update manifest: {}", err))?;
     Ok(signed_update_manifest.manifest)
 }
@@ -342,7 +360,7 @@ fn get_windows_path_var() -> Result<Option<String>, String> {
 }
 
 #[cfg(windows)]
-fn add_to_path(new_path: &str) -> Result<bool, String> {
+fn add_to_path(new_path: &str) -> bool {
     use std::ptr;
     use winapi::shared::minwindef::*;
     use winapi::um::winuser::{
@@ -351,10 +369,12 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
     use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::{RegKey, RegValue};
 
-    let old_path = if let Some(s) = get_windows_path_var()? {
+    let old_path = if let Some(s) =
+        get_windows_path_var().unwrap_or_else(|err| panic!("Unable to get PATH: {}", err))
+    {
         s
     } else {
-        return Ok(false);
+        return false;
     };
 
     if !old_path.contains(&new_path) {
@@ -367,7 +387,7 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
         let root = RegKey::predef(HKEY_CURRENT_USER);
         let environment = root
             .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-            .map_err(|err| format!("Unable to open HKEY_CURRENT_USER\\Environment: {}", err))?;
+            .unwrap_or_else(|err| panic!("Unable to open HKEY_CURRENT_USER\\Environment: {}", err));
 
         let reg_value = RegValue {
             bytes: string_to_winreg_bytes(&new_path),
@@ -376,7 +396,9 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
 
         environment
             .set_raw_value("PATH", &reg_value)
-            .map_err(|err| format!("Unable set HKEY_CURRENT_USER\\Environment\\PATH: {}", err))?;
+            .unwrap_or_else(|err| {
+                panic!("Unable set HKEY_CURRENT_USER\\Environment\\PATH: {}", err)
+            });
 
         // Tell other processes to update their environment
         unsafe {
@@ -398,28 +420,28 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
         new_path,
         style("Future applications will automatically have the correct environment, but you may need to restart your current shell.").bold()
     );
-    Ok(true)
+    true
 }
 
 #[cfg(unix)]
-fn add_to_path(new_path: &str) -> Result<bool, String> {
+fn add_to_path(new_path: &str) -> bool {
     let shell_export_string = format!(r#"export PATH="{}:$PATH""#, new_path);
     let mut modified_rcfiles = false;
 
     // Look for sh, bash, and zsh rc files
-    let mut rcfiles = vec![dirs::home_dir().map(|p| p.join(".profile"))];
+    let mut rcfiles = vec![dirs_next::home_dir().map(|p| p.join(".profile"))];
     if let Ok(shell) = std::env::var("SHELL") {
         if shell.contains("zsh") {
             let zdotdir = std::env::var("ZDOTDIR")
                 .ok()
                 .map(PathBuf::from)
-                .or_else(dirs::home_dir);
+                .or_else(dirs_next::home_dir);
             let zprofile = zdotdir.map(|p| p.join(".zprofile"));
             rcfiles.push(zprofile);
         }
     }
 
-    if let Some(bash_profile) = dirs::home_dir().map(|p| p.join(".bash_profile")) {
+    if let Some(bash_profile) = dirs_next::home_dir().map(|p| p.join(".bash_profile")) {
         // Only update .bash_profile if it exists because creating .bash_profile
         // will cause .profile to not be read
         if bash_profile.exists() {
@@ -484,7 +506,7 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
        );
     }
 
-    Ok(modified_rcfiles)
+    modified_rcfiles
 }
 
 pub fn init(
@@ -493,13 +515,19 @@ pub fn init(
     json_rpc_url: &str,
     update_manifest_pubkey: &Pubkey,
     no_modify_path: bool,
+    explicit_release: Option<ExplicitRelease>,
 ) -> Result<(), String> {
     let config = {
         // Write new config file only if different, so that running |solana-install init|
         // repeatedly doesn't unnecessarily re-download
         let mut current_config = Config::load(config_file).unwrap_or_default();
         current_config.current_update_manifest = None;
-        let config = Config::new(data_dir, json_rpc_url, update_manifest_pubkey);
+        let config = Config::new(
+            data_dir,
+            json_rpc_url,
+            update_manifest_pubkey,
+            explicit_release,
+        );
         if current_config != config {
             config.save(config_file)?;
         }
@@ -509,35 +537,93 @@ pub fn init(
     update(config_file)?;
 
     let path_modified = if !no_modify_path {
-        add_to_path(&config.active_release_bin_dir().to_str().unwrap())?
+        add_to_path(&config.active_release_bin_dir().to_str().unwrap())
     } else {
         false
     };
 
-    if !path_modified {
+    if !path_modified && !no_modify_path {
         check_env_path_for_bin_dir(&config);
     }
     Ok(())
 }
 
-pub fn info(config_file: &str, local_info_only: bool) -> Result<Option<UpdateManifest>, String> {
+fn github_release_download_url(release_semver: &str) -> String {
+    format!(
+        "https://github.com/solana-labs/solana/releases/download/v{}/solana-release-{}.tar.bz2",
+        release_semver,
+        crate::build_env::TARGET
+    )
+}
+
+fn release_channel_download_url(release_channel: &str) -> String {
+    format!(
+        "http://release.solana.com/{}/solana-release-{}.tar.bz2",
+        release_channel,
+        crate::build_env::TARGET
+    )
+}
+
+fn release_channel_version_url(release_channel: &str) -> String {
+    format!(
+        "http://release.solana.com/{}/solana-release-{}.yml",
+        release_channel,
+        crate::build_env::TARGET
+    )
+}
+
+pub fn info(
+    config_file: &str,
+    local_info_only: bool,
+    eval: bool,
+) -> Result<Option<UpdateManifest>, String> {
     let config = Config::load(config_file)?;
-    println_name_value("JSON RPC URL:", &config.json_rpc_url);
-    println_name_value(
-        "Update manifest pubkey:",
-        &config.update_manifest_pubkey.to_string(),
-    );
+
+    if eval {
+        println!(
+            "SOLANA_INSTALL_ACTIVE_RELEASE={}",
+            &config.active_release_dir().to_str().unwrap_or("")
+        );
+        return Ok(None);
+    }
+
     println_name_value("Configuration:", &config_file);
     println_name_value(
         "Active release directory:",
         &config.active_release_dir().to_str().unwrap_or("?"),
     );
 
+    if let Some(explicit_release) = &config.explicit_release {
+        match explicit_release {
+            ExplicitRelease::Semver(release_semver) => {
+                println_name_value(&format!("{}Release version:", BULLET), &release_semver);
+                println_name_value(
+                    &format!("{}Release URL:", BULLET),
+                    &github_release_download_url(release_semver),
+                );
+            }
+            ExplicitRelease::Channel(release_channel) => {
+                println_name_value(&format!("{}Release channel:", BULLET), &release_channel);
+                println_name_value(
+                    &format!("{}Release URL:", BULLET),
+                    &release_channel_download_url(release_channel),
+                );
+            }
+        }
+        return Ok(None);
+    }
+
+    println_name_value("JSON RPC URL:", &config.json_rpc_url);
+    println_name_value(
+        "Update manifest pubkey:",
+        &config.update_manifest_pubkey.to_string(),
+    );
+
     fn print_update_manifest(update_manifest: &UpdateManifest) {
         let when = Local.timestamp(update_manifest.timestamp_secs as i64, 0);
-        println_name_value(&format!("{}release date", BULLET), &when.to_string());
+        println_name_value(&format!("{}release date:", BULLET), &when.to_string());
         println_name_value(
-            &format!("{}download URL", BULLET),
+            &format!("{}download URL:", BULLET),
             &update_manifest.download_url,
         );
     }
@@ -578,17 +664,23 @@ pub fn deploy(
     download_url: &str,
     update_manifest_keypair_file: &str,
 ) -> Result<(), String> {
-    let from_keypair = read_keypair(from_keypair_file)
+    let from_keypair = read_keypair_file(from_keypair_file)
         .map_err(|err| format!("Unable to read {}: {}", from_keypair_file, err))?;
-    let update_manifest_keypair = read_keypair(update_manifest_keypair_file)
+    let update_manifest_keypair = read_keypair_file(update_manifest_keypair_file)
         .map_err(|err| format!("Unable to read {}: {}", update_manifest_keypair_file, err))?;
+
+    println_name_value("JSON RPC URL:", json_rpc_url);
+    println_name_value(
+        "Update manifest pubkey:",
+        &update_manifest_keypair.pubkey().to_string(),
+    );
 
     // Confirm the `json_rpc_url` is good and that `from_keypair` is a valid account
     let rpc_client = RpcClient::new(json_rpc_url.to_string());
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message(&format!("{}Checking cluster...", LOOKING_GLASS));
     let balance = rpc_client
-        .retry_get_balance(&from_keypair.pubkey(), 5)
+        .get_balance(&from_keypair.pubkey())
         .map_err(|err| {
             format!(
                 "Unable to get the account balance of {}: {}",
@@ -596,14 +688,25 @@ pub fn deploy(
             )
         })?;
     progress_bar.finish_and_clear();
-    if balance.unwrap_or(0) == 0 {
-        Err(format!("{} account balance is empty", from_keypair_file))?;
+    if balance == 0 {
+        return Err(format!("{} account balance is empty", from_keypair_file));
     }
 
     // Download the release
-    let (temp_dir, temp_archive, temp_archive_sha256) =
-        download_to_temp_archive(download_url, None)
-            .map_err(|err| format!("Unable to download {}: {}", download_url, err))?;
+    let (temp_dir, temp_archive, temp_archive_sha256) = download_to_temp(download_url, None)
+        .map_err(|err| format!("Unable to download {}: {}", download_url, err))?;
+
+    if let Ok(update_manifest) = get_update_manifest(&rpc_client, &update_manifest_keypair.pubkey())
+    {
+        if temp_archive_sha256 == update_manifest.download_sha256 {
+            println!(
+                "  {}{}",
+                INFORMATION,
+                style("Update is already deployed").bold()
+            );
+            return Ok(());
+        }
+    }
 
     // Extract it and load the release version metadata
     let temp_release_dir = temp_dir.path().join("archive");
@@ -621,12 +724,7 @@ pub fn deploy(
         )
     })?;
 
-    println_name_value("JSON RPC URL:", json_rpc_url);
     println_name_value("Update target:", &release_target);
-    println_name_value(
-        "Update manifest pubkey:",
-        &update_manifest_keypair.pubkey().to_string(),
-    );
 
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message(&format!("{}Deploying update...", PACKAGE));
@@ -670,44 +768,110 @@ fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> std::io::Resul
 }
 
 pub fn update(config_file: &str) -> Result<bool, String> {
-    let update_manifest = info(config_file, false)?;
-    if update_manifest.is_none() {
-        return Ok(false);
-    }
-    let update_manifest = update_manifest.unwrap();
-
-    if timestamp_secs()
-        < u64::from_str_radix(crate::build_env::BUILD_SECONDS_SINCE_UNIX_EPOCH, 10).unwrap()
-    {
-        Err("Unable to update as system time seems unreliable".to_string())?
-    }
-
     let mut config = Config::load(config_file)?;
-    if let Some(ref current_update_manifest) = config.current_update_manifest {
-        if update_manifest.timestamp_secs < current_update_manifest.timestamp_secs {
-            Err("Unable to update to an older version".to_string())?
+    let update_manifest = info(config_file, false, false)?;
+
+    let release_dir = if let Some(explicit_release) = &config.explicit_release {
+        let (download_url, release_dir) = match explicit_release {
+            ExplicitRelease::Semver(release_semver) => {
+                let download_url = github_release_download_url(release_semver);
+                let release_dir = config.release_dir(&release_semver);
+                let download_url = if release_dir.join(".ok").exists() {
+                    // If this release_semver has already been successfully downloaded, no update
+                    // needed
+                    println!("{} is present, no download required.", release_semver);
+                    None
+                } else {
+                    Some(download_url)
+                };
+                (download_url, release_dir)
+            }
+            ExplicitRelease::Channel(release_channel) => {
+                let release_dir = config.release_dir(&release_channel);
+                let current_release_version_yml =
+                    release_dir.join("solana-release").join("version.yml");
+                let download_url = Some(release_channel_download_url(release_channel));
+
+                if !current_release_version_yml.exists() {
+                    (download_url, release_dir)
+                } else {
+                    let version_url = release_channel_version_url(release_channel);
+
+                    let (_temp_dir, temp_file, _temp_archive_sha256) =
+                        download_to_temp(&version_url, None).map_err(|err| {
+                            format!("Unable to download {}: {}", version_url, err)
+                        })?;
+
+                    let update_release_version = load_release_version(&temp_file)?;
+                    let current_release_version =
+                        load_release_version(&current_release_version_yml)?;
+
+                    if update_release_version.commit == current_release_version.commit {
+                        // Same commit, no update required
+                        println!(
+                            "Latest {} build is already present, no download required.",
+                            release_channel
+                        );
+                        (None, release_dir)
+                    } else {
+                        (download_url, release_dir)
+                    }
+                }
+            }
+        };
+
+        if let Some(download_url) = download_url {
+            let (_temp_dir, temp_archive, _temp_archive_sha256) =
+                download_to_temp(&download_url, None)
+                    .map_err(|err| format!("Unable to download {}: {}", download_url, err))?;
+            extract_release_archive(&temp_archive, &release_dir).map_err(|err| {
+                format!(
+                    "Unable to extract {:?} to {:?}: {}",
+                    temp_archive, release_dir, err
+                )
+            })?;
+            let _ = fs::create_dir_all(release_dir.join(".ok"));
         }
-    }
 
-    let (_temp_dir, temp_archive, _temp_archive_sha256) = download_to_temp_archive(
-        &update_manifest.download_url,
-        Some(&update_manifest.download_sha256),
-    )
-    .map_err(|err| {
-        format!(
-            "Unable to download {}: {}",
-            update_manifest.download_url, err
+        release_dir
+    } else {
+        if update_manifest.is_none() {
+            return Ok(false);
+        }
+        let update_manifest = update_manifest.unwrap();
+
+        if timestamp_secs()
+            < u64::from_str_radix(crate::build_env::BUILD_SECONDS_SINCE_UNIX_EPOCH, 10).unwrap()
+        {
+            return Err("Unable to update as system time seems unreliable".to_string());
+        }
+
+        if let Some(ref current_update_manifest) = config.current_update_manifest {
+            if update_manifest.timestamp_secs < current_update_manifest.timestamp_secs {
+                return Err("Unable to update to an older version".to_string());
+            }
+        }
+        let release_dir = config.release_dir(&update_manifest.download_sha256.to_string());
+        let (_temp_dir, temp_archive, _temp_archive_sha256) = download_to_temp(
+            &update_manifest.download_url,
+            Some(&update_manifest.download_sha256),
         )
-    })?;
+        .map_err(|err| {
+            format!(
+                "Unable to download {}: {}",
+                update_manifest.download_url, err
+            )
+        })?;
+        extract_release_archive(&temp_archive, &release_dir).map_err(|err| {
+            format!(
+                "Unable to extract {:?} to {:?}: {}",
+                temp_archive, release_dir, err
+            )
+        })?;
 
-    let release_dir = config.release_dir(&update_manifest.download_sha256);
-
-    extract_release_archive(&temp_archive, &release_dir).map_err(|err| {
-        format!(
-            "Unable to extract {:?} to {:?}: {}",
-            temp_archive, release_dir, err
-        )
-    })?;
+        config.current_update_manifest = Some(update_manifest);
+        release_dir
+    };
 
     let release_target = load_release_target(&release_dir).map_err(|err| {
         format!(
@@ -717,7 +881,7 @@ pub fn update(config_file: &str) -> Result<bool, String> {
     })?;
 
     if release_target != crate::build_env::TARGET {
-        Err(format!("Incompatible update target: {}", release_target))?;
+        return Err(format!("Incompatible update target: {}", release_target));
     }
 
     let _ = fs::remove_dir_all(config.active_release_dir());
@@ -734,7 +898,6 @@ pub fn update(config_file: &str) -> Result<bool, String> {
         )
     })?;
 
-    config.current_update_manifest = Some(update_manifest);
     config.save(config_file)?;
 
     println!("  {}{}", SPARKLE, style("Update successful").bold());
@@ -748,16 +911,27 @@ pub fn run(
 ) -> Result<(), String> {
     let config = Config::load(config_file)?;
 
-    let full_program_path = config.active_release_bin_dir().join(program_name);
+    let mut full_program_path = config.active_release_bin_dir().join(program_name);
+    if cfg!(windows) && full_program_path.extension().is_none() {
+        full_program_path.set_extension("exe");
+    }
+
     if !full_program_path.exists() {
-        Err(format!(
+        return Err(format!(
             "{} does not exist",
             full_program_path.to_str().unwrap()
-        ))?;
+        ));
     }
 
     let mut child_option: Option<std::process::Child> = None;
     let mut now = Instant::now();
+
+    let (signal_sender, signal_receiver) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = signal_sender.send(());
+    })
+    .expect("Error setting Ctrl-C handler");
+
     loop {
         child_option = match child_option {
             Some(mut child) => match child.try_wait() {
@@ -788,12 +962,14 @@ pub fn run(
             }
         };
 
-        if now.elapsed().as_secs() > config.update_poll_secs {
+        if config.explicit_release.is_none() && now.elapsed().as_secs() > config.update_poll_secs {
             match update(config_file) {
                 Ok(true) => {
                     // Update successful, kill current process so it will be restart
                     if let Some(ref mut child) = child_option {
-                        println!("Killing program: {:?}", child.kill());
+                        stop_process(child).unwrap_or_else(|err| {
+                            eprintln!("Failed to stop child: {:?}", err);
+                        });
                     }
                 }
                 Ok(false) => {} // No update available
@@ -803,6 +979,15 @@ pub fn run(
             };
             now = Instant::now();
         }
-        sleep(Duration::from_secs(1));
+
+        if let Ok(()) = signal_receiver.recv_timeout(Duration::from_secs(1)) {
+            // Handle SIGTERM...
+            if let Some(ref mut child) = child_option {
+                stop_process(child).unwrap_or_else(|err| {
+                    eprintln!("Failed to stop child: {:?}", err);
+                });
+            }
+            std::process::exit(0);
+        }
     }
 }

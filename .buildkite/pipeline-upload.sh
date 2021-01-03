@@ -9,12 +9,10 @@
 
 set -e
 cd "$(dirname "$0")"/..
+source ci/_
 
-buildkite-agent pipeline upload ci/buildkite.yml
+_ ci/buildkite-pipeline.sh pipeline.yml
+echo +++ pipeline
+cat pipeline.yml
 
-if [[ $BUILDKITE_BRANCH =~ ^pull ]]; then
-  # Add helpful link back to the corresponding Github Pull Request
-  buildkite-agent annotate --style info --context pr-backlink \
-    "Github Pull Request: https://github.com/solana-labs/solana/$BUILDKITE_BRANCH"
-fi
-
+_ buildkite-agent pipeline upload pipeline.yml

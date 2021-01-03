@@ -3,10 +3,12 @@
 use crate::banking_stage::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET;
 use crate::poh_recorder::PohRecorder;
 use crate::result::{Error, Result};
-use crate::service::Service;
-use crate::streamer::{self, PacketReceiver, PacketSender};
+use solana_measure::thread_mem_usage;
 use solana_metrics::{inc_new_counter_debug, inc_new_counter_info};
-use solana_sdk::timing::DEFAULT_TICKS_PER_SLOT;
+use solana_perf::packet::PacketsRecycler;
+use solana_perf::recycler::Recycler;
+use solana_sdk::clock::DEFAULT_TICKS_PER_SLOT;
+use solana_streamer::streamer::{self, PacketReceiver, PacketSender};
 use std::net::UdpSocket;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -21,28 +23,28 @@ impl FetchStage {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(
         sockets: Vec<UdpSocket>,
-        tpu_via_blobs_sockets: Vec<UdpSocket>,
+        tpu_forwards_sockets: Vec<UdpSocket>,
         exit: &Arc<AtomicBool>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
     ) -> (Self, PacketReceiver) {
         let (sender, receiver) = channel();
         (
-            Self::new_with_sender(sockets, tpu_via_blobs_sockets, exit, &sender, &poh_recorder),
+            Self::new_with_sender(sockets, tpu_forwards_sockets, exit, &sender, &poh_recorder),
             receiver,
         )
     }
     pub fn new_with_sender(
         sockets: Vec<UdpSocket>,
-        tpu_via_blobs_sockets: Vec<UdpSocket>,
+        tpu_forwards_sockets: Vec<UdpSocket>,
         exit: &Arc<AtomicBool>,
         sender: &PacketSender,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
     ) -> Self {
         let tx_sockets = sockets.into_iter().map(Arc::new).collect();
-        let tpu_via_blobs_sockets = tpu_via_blobs_sockets.into_iter().map(Arc::new).collect();
+        let tpu_forwards_sockets = tpu_forwards_sockets.into_iter().map(Arc::new).collect();
         Self::new_multi_socket(
             tx_sockets,
-            tpu_via_blobs_sockets,
+            tpu_forwards_sockets,
             exit,
             &sender,
             &poh_recorder,
@@ -60,6 +62,10 @@ impl FetchStage {
         while let Ok(more) = recvr.try_recv() {
             len += more.packets.len();
             batch.push(more);
+            // Read at most 1K transactions in a loop
+            if len > 1024 {
+                break;
+            }
         }
 
         if poh_recorder.lock().unwrap().would_be_leader(
@@ -82,19 +88,33 @@ impl FetchStage {
 
     fn new_multi_socket(
         sockets: Vec<Arc<UdpSocket>>,
-        tpu_via_blobs_sockets: Vec<Arc<UdpSocket>>,
+        tpu_forwards_sockets: Vec<Arc<UdpSocket>>,
         exit: &Arc<AtomicBool>,
         sender: &PacketSender,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
     ) -> Self {
-        let tpu_threads = sockets
-            .into_iter()
-            .map(|socket| streamer::receiver(socket, &exit, sender.clone()));
+        let recycler: PacketsRecycler = Recycler::warmed(1000, 1024);
+
+        let tpu_threads = sockets.into_iter().map(|socket| {
+            streamer::receiver(
+                socket,
+                &exit,
+                sender.clone(),
+                recycler.clone(),
+                "fetch_stage",
+            )
+        });
 
         let (forward_sender, forward_receiver) = channel();
-        let tpu_via_blobs_threads = tpu_via_blobs_sockets
-            .into_iter()
-            .map(|socket| streamer::blob_packet_receiver(socket, &exit, forward_sender.clone()));
+        let tpu_forwards_threads = tpu_forwards_sockets.into_iter().map(|socket| {
+            streamer::receiver(
+                socket,
+                &exit,
+                forward_sender.clone(),
+                recycler.clone(),
+                "fetch_forward_stage",
+            )
+        });
 
         let sender = sender.clone();
         let poh_recorder = poh_recorder.clone();
@@ -102,6 +122,7 @@ impl FetchStage {
         let fwd_thread_hdl = Builder::new()
             .name("solana-fetch-stage-fwd-rcvr".to_string())
             .spawn(move || loop {
+                thread_mem_usage::datapoint("solana-fetch-stage-fwd-rcvr");
                 if let Err(e) =
                     Self::handle_forwarded_packets(&forward_receiver, &sender, &poh_recorder)
                 {
@@ -116,16 +137,12 @@ impl FetchStage {
             })
             .unwrap();
 
-        let mut thread_hdls: Vec<_> = tpu_threads.chain(tpu_via_blobs_threads).collect();
+        let mut thread_hdls: Vec<_> = tpu_threads.chain(tpu_forwards_threads).collect();
         thread_hdls.push(fwd_thread_hdl);
         Self { thread_hdls }
     }
-}
 
-impl Service for FetchStage {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         for thread_hdl in self.thread_hdls {
             thread_hdl.join()?;
         }

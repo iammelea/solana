@@ -1,153 +1,167 @@
 //! Native loader
-use crate::message_processor::SymbolCache;
-use bincode::deserialize;
 #[cfg(unix)]
 use libloading::os::unix::*;
 #[cfg(windows)]
 use libloading::os::windows::*;
 use log::*;
-use solana_sdk::account::KeyedAccount;
-use solana_sdk::instruction::InstructionError;
-use solana_sdk::instruction_processor_utils;
-use solana_sdk::loader_instruction::LoaderInstruction;
-use solana_sdk::pubkey::Pubkey;
-use std::env;
-use std::path::PathBuf;
-use std::str;
+use num_derive::{FromPrimitive, ToPrimitive};
+use solana_sdk::{
+    decode_error::DecodeError,
+    entrypoint_native::ProgramEntrypoint,
+    instruction::InstructionError,
+    keyed_account::{next_keyed_account, KeyedAccount},
+    process_instruction::{InvokeContext, LoaderEntrypoint},
+    pubkey::Pubkey,
+};
+use std::{collections::HashMap, env, path::PathBuf, str, sync::RwLock};
+use thiserror::Error;
+
+#[derive(Error, Debug, Serialize, Clone, PartialEq, FromPrimitive, ToPrimitive)]
+pub enum NativeLoaderError {
+    #[error("Entrypoint name in the account data is not a valid UTF-8 string")]
+    InvalidAccountData = 0x0aaa_0001,
+    #[error("Entrypoint was not found in the module")]
+    EntrypointNotFound = 0x0aaa_0002,
+    #[error("Failed to load the module")]
+    FailedToLoad = 0x0aaa_0003,
+}
+impl<T> DecodeError<T> for NativeLoaderError {
+    fn type_of() -> &'static str {
+        "NativeLoaderError"
+    }
+}
 
 /// Dynamic link library prefixes
 #[cfg(unix)]
-const PLATFORM_FILE_PREFIX_NATIVE: &str = "lib";
+const PLATFORM_FILE_PREFIX: &str = "lib";
 #[cfg(windows)]
-const PLATFORM_FILE_PREFIX_NATIVE: &str = "";
+const PLATFORM_FILE_PREFIX: &str = "";
 
 /// Dynamic link library file extension specific to the platform
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-const PLATFORM_FILE_EXTENSION_NATIVE: &str = "dylib";
+const PLATFORM_FILE_EXTENSION: &str = "dylib";
 /// Dynamic link library file extension specific to the platform
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
-const PLATFORM_FILE_EXTENSION_NATIVE: &str = "so";
+const PLATFORM_FILE_EXTENSION: &str = "so";
 /// Dynamic link library file extension specific to the platform
 #[cfg(windows)]
-const PLATFORM_FILE_EXTENSION_NATIVE: &str = "dll";
+const PLATFORM_FILE_EXTENSION: &str = "dll";
 
-fn create_path(name: &str) -> PathBuf {
-    let current_exe = env::current_exe()
-        .unwrap_or_else(|e| panic!("create_path(\"{}\"): current exe not found: {:?}", name, e));
-    let current_exe_directory = PathBuf::from(current_exe.parent().unwrap_or_else(|| {
-        panic!(
-            "create_path(\"{}\"): no parent directory of {:?}",
-            name, current_exe,
-        )
-    }));
+pub type ProgramSymbolCache = RwLock<HashMap<String, Symbol<ProgramEntrypoint>>>;
+pub type LoaderSymbolCache = RwLock<HashMap<String, Symbol<LoaderEntrypoint>>>;
 
-    let library_file_name = PathBuf::from(PLATFORM_FILE_PREFIX_NATIVE.to_string() + name)
-        .with_extension(PLATFORM_FILE_EXTENSION_NATIVE);
+#[derive(Debug, Default)]
+pub struct NativeLoader {
+    program_symbol_cache: ProgramSymbolCache,
+    loader_symbol_cache: LoaderSymbolCache,
+}
+impl NativeLoader {
+    fn create_path(name: &str) -> Result<PathBuf, InstructionError> {
+        let current_exe = env::current_exe().map_err(|e| {
+            error!("create_path(\"{}\"): current exe not found: {:?}", name, e);
+            InstructionError::from(NativeLoaderError::EntrypointNotFound)
+        })?;
+        let current_exe_directory = PathBuf::from(current_exe.parent().ok_or_else(|| {
+            error!(
+                "create_path(\"{}\"): no parent directory of {:?}",
+                name, current_exe
+            );
+            InstructionError::from(NativeLoaderError::FailedToLoad)
+        })?);
 
-    // Check the current_exe directory for the library as `cargo tests` are run
-    // from the deps/ subdirectory
-    let file_path = current_exe_directory.join(&library_file_name);
-    if file_path.exists() {
-        file_path
-    } else {
-        // `cargo build` places dependent libraries in the deps/ subdirectory
-        current_exe_directory.join("deps").join(library_file_name)
+        let library_file_name = PathBuf::from(PLATFORM_FILE_PREFIX.to_string() + name)
+            .with_extension(PLATFORM_FILE_EXTENSION);
+
+        // Check the current_exe directory for the library as `cargo tests` are run
+        // from the deps/ subdirectory
+        let file_path = current_exe_directory.join(&library_file_name);
+        if file_path.exists() {
+            Ok(file_path)
+        } else {
+            // `cargo build` places dependent libraries in the deps/ subdirectory
+            Ok(current_exe_directory.join("deps").join(library_file_name))
+        }
     }
-}
 
-#[cfg(windows)]
-fn library_open(path: &PathBuf) -> std::io::Result<Library> {
-    Library::new(path)
-}
+    #[cfg(windows)]
+    fn library_open(path: &PathBuf) -> Result<Library, libloading::Error> {
+        Library::new(path)
+    }
 
-#[cfg(not(windows))]
-fn library_open(path: &PathBuf) -> std::io::Result<Library> {
-    // TODO linux tls bug can cause crash on dlclose(), workaround by never unloading
-    Library::open(Some(path), libc::RTLD_NODELETE | libc::RTLD_NOW)
-}
+    #[cfg(not(windows))]
+    fn library_open(path: &PathBuf) -> Result<Library, libloading::Error> {
+        // Linux tls bug can cause crash on dlclose(), workaround by never unloading
+        Library::open(Some(path), libc::RTLD_NODELETE | libc::RTLD_NOW)
+    }
 
-pub fn entrypoint(
-    program_id: &Pubkey,
-    keyed_accounts: &mut [KeyedAccount],
-    ix_data: &[u8],
-    symbol_cache: &SymbolCache,
-) -> Result<(), InstructionError> {
-    if keyed_accounts[0].account.executable {
-        // dispatch it
-        let (names, params) = keyed_accounts.split_at_mut(1);
-        let name_vec = &names[0].account.data;
-        if let Some(entrypoint) = symbol_cache.read().unwrap().get(name_vec) {
-            unsafe {
-                return entrypoint(program_id, params, ix_data);
+    fn get_entrypoint<T>(
+        name: &str,
+        cache: &RwLock<HashMap<String, Symbol<T>>>,
+    ) -> Result<Symbol<T>, InstructionError> {
+        let mut cache = cache.write().unwrap();
+        if let Some(entrypoint) = cache.get(name) {
+            Ok(entrypoint.clone())
+        } else {
+            match Self::library_open(&Self::create_path(&name)?) {
+                Ok(library) => {
+                    let result = unsafe { library.get::<T>(name.as_bytes()) };
+                    match result {
+                        Ok(entrypoint) => {
+                            cache.insert(name.to_string(), entrypoint.clone());
+                            Ok(entrypoint)
+                        }
+                        Err(e) => {
+                            error!("Unable to find program entrypoint in {:?}: {:?})", name, e);
+                            Err(NativeLoaderError::EntrypointNotFound.into())
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load: {:?}", e);
+                    Err(NativeLoaderError::FailedToLoad.into())
+                }
             }
         }
+    }
+
+    pub fn process_instruction(
+        &self,
+        _program_id: &Pubkey,
+        keyed_accounts: &[KeyedAccount],
+        instruction_data: &[u8],
+        invoke_context: &dyn InvokeContext,
+    ) -> Result<(), InstructionError> {
+        let mut keyed_accounts_iter = keyed_accounts.iter();
+        let program = next_keyed_account(&mut keyed_accounts_iter)?;
+        let params = keyed_accounts_iter.as_slice();
+        let name_vec = &program.try_account_ref()?.data;
         let name = match str::from_utf8(name_vec) {
             Ok(v) => v,
             Err(e) => {
-                warn!("Invalid UTF-8 sequence: {}", e);
-                return Err(InstructionError::GenericError);
+                error!("Invalid UTF-8 sequence: {}", e);
+                return Err(NativeLoaderError::InvalidAccountData.into());
             }
         };
+        if name.is_empty() || name.starts_with('\0') {
+            error!("Empty name string");
+            return Err(NativeLoaderError::InvalidAccountData.into());
+        }
         trace!("Call native {:?}", name);
-        let path = create_path(&name);
-        match library_open(&path) {
-            Ok(library) => unsafe {
-                let entrypoint: Symbol<instruction_processor_utils::Entrypoint> =
-                    match library.get(instruction_processor_utils::ENTRYPOINT.as_bytes()) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(
-                                "{:?}: Unable to find {:?} in program",
-                                e,
-                                instruction_processor_utils::ENTRYPOINT
-                            );
-                            return Err(InstructionError::GenericError);
-                        }
-                    };
-                let ret = entrypoint(program_id, params, ix_data);
-                symbol_cache
-                    .write()
-                    .unwrap()
-                    .insert(name_vec.to_vec(), entrypoint);
-                return ret;
-            },
-            Err(e) => {
-                warn!("Unable to load: {:?}", e);
-                return Err(InstructionError::GenericError);
+        if name.ends_with("loader_program") {
+            let entrypoint =
+                Self::get_entrypoint::<LoaderEntrypoint>(name, &self.loader_symbol_cache)?;
+            unsafe {
+                entrypoint(
+                    program.unsigned_key(),
+                    params,
+                    instruction_data,
+                    invoke_context,
+                )
             }
+        } else {
+            let entrypoint =
+                Self::get_entrypoint::<ProgramEntrypoint>(name, &self.program_symbol_cache)?;
+            unsafe { entrypoint(program.unsigned_key(), params, instruction_data) }
         }
-    } else if let Ok(instruction) = deserialize(ix_data) {
-        if keyed_accounts[0].signer_key().is_none() {
-            warn!("key[0] did not sign the transaction");
-            return Err(InstructionError::GenericError);
-        }
-        match instruction {
-            LoaderInstruction::Write { offset, bytes } => {
-                trace!("NativeLoader::Write offset {} bytes {:?}", offset, bytes);
-                let offset = offset as usize;
-                if keyed_accounts[0].account.data.len() < offset + bytes.len() {
-                    warn!(
-                        "Error: Overflow, {} < {}",
-                        keyed_accounts[0].account.data.len(),
-                        offset + bytes.len()
-                    );
-                    return Err(InstructionError::GenericError);
-                }
-                // native loader takes a name and we assume it all comes in at once
-                keyed_accounts[0].account.data = bytes;
-            }
-
-            LoaderInstruction::Finalize => {
-                keyed_accounts[0].account.executable = true;
-                trace!(
-                    "NativeLoader::Finalize prog: {:?}",
-                    keyed_accounts[0].signer_key().unwrap()
-                );
-            }
-        }
-    } else {
-        warn!("Invalid data in instruction: {:?}", ix_data);
-        return Err(InstructionError::GenericError);
     }
-    Ok(())
 }

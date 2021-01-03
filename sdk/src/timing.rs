@@ -1,42 +1,5 @@
 //! The `timing` module provides std::time utility functions.
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-// The default tick rate that the cluster attempts to achieve.  Note that the actual tick
-// rate at any given time should be expected to drift
-pub const DEFAULT_NUM_TICKS_PER_SECOND: u64 = 10;
-
-// At 10 ticks/s, 8 ticks per slot implies that leader rotation and voting will happen
-// every 800 ms. A fast voting cadence ensures faster finality and convergence
-pub const DEFAULT_TICKS_PER_SLOT: u64 = 8;
-
-// 1 Epoch = 800 * 4096 ms ~= 55 minutes
-pub const DEFAULT_SLOTS_PER_EPOCH: u64 = 4096;
-
-pub const NUM_CONSECUTIVE_LEADER_SLOTS: u64 = 8;
-
-/// The time window of recent block hash values that the bank will track the signatures
-/// of over. Once the bank discards a block hash, it will reject any transactions that use
-/// that `recent_blockhash` in a transaction. Lowering this value reduces memory consumption,
-/// but requires clients to update its `recent_blockhash` more frequently. Raising the value
-/// lengthens the time a client must wait to be certain a missing transaction will
-/// not be processed by the network.
-pub const MAX_HASH_AGE_IN_SECONDS: usize = 120;
-
-// This must be <= MAX_HASH_AGE_IN_SECONDS, otherwise there's risk for DuplicateSignature errors
-pub const MAX_RECENT_BLOCKHASHES: usize = MAX_HASH_AGE_IN_SECONDS;
-
-// The maximum age of a blockhash that will be accepted by the leader
-pub const MAX_PROCESSING_AGE: usize = MAX_RECENT_BLOCKHASHES / 2;
-
-/// This is maximum time consumed in forwarding a transaction from one node to next, before
-/// it can be processed in the target node
-#[cfg(feature = "cuda")]
-pub const MAX_TRANSACTION_FORWARDING_DELAY: usize = 4;
-
-/// More delay is expected if CUDA is not enabled (as signature verification takes longer)
-#[cfg(not(feature = "cuda"))]
-pub const MAX_TRANSACTION_FORWARDING_DELAY: usize = 12;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn duration_as_ns(d: &Duration) -> u64 {
     d.as_secs() * 1_000_000_000 + u64::from(d.subsec_nanos())
@@ -61,10 +24,75 @@ pub fn timestamp() -> u64 {
     duration_as_ms(&now)
 }
 
-/// Slot is a unit of time given to a leader for encoding,
-///  is some some number of Ticks long.  Use a u64 to count them.
-pub type Slot = u64;
+pub const SECONDS_PER_YEAR: f64 = 365.242_199 * 24.0 * 60.0 * 60.0;
 
-/// Epoch is a unit of time a given leader schedule is honored,
-///  some number of Slots.  Use a u64 to count them.
-pub type Epoch = u64;
+/// from years to slots
+pub fn years_as_slots(years: f64, tick_duration: &Duration, ticks_per_slot: u64) -> f64 {
+    // slots is  years * slots/year
+    years       *
+    //  slots/year  is  seconds/year ...
+        SECONDS_PER_YEAR
+    //  * (ns/s)/(ns/tick) / ticks/slot = 1/s/1/tick = ticks/s
+        *(1_000_000_000.0 / duration_as_ns(tick_duration) as f64)
+    //  / ticks/slot
+        / ticks_per_slot as f64
+}
+
+/// From slots per year to slot duration
+pub fn slot_duration_from_slots_per_year(slots_per_year: f64) -> Duration {
+    // Recently, rust changed from infinity as usize being zero to 2^64-1; ensure it's zero here
+    let slot_in_ns = if slots_per_year != 0.0 {
+        (SECONDS_PER_YEAR * 1_000_000_000.0) / slots_per_year
+    } else {
+        0.0
+    };
+    Duration::from_nanos(slot_in_ns as u64)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_years_as_slots() {
+        let tick_duration = Duration::from_micros(1000 * 1000 / 160);
+
+        // interestingly large numbers with 160 ticks/second
+        assert_eq!(years_as_slots(0.0, &tick_duration, 4) as u64, 0);
+        assert_eq!(
+            years_as_slots(1.0 / 12f64, &tick_duration, 4) as u64,
+            105_189_753
+        );
+        assert_eq!(years_as_slots(1.0, &tick_duration, 4) as u64, 1_262_277_039);
+
+        let tick_duration = Duration::from_micros(1000 * 1000);
+        // one second in years with one tick per second + one tick per slot
+        assert_eq!(
+            years_as_slots(1.0 / SECONDS_PER_YEAR, &tick_duration, 1),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_slot_duration_from_slots_per_year() {
+        let slots_per_year = 1_262_277_039.0;
+        let ticks_per_slot = 4;
+
+        assert_eq!(
+            slot_duration_from_slots_per_year(slots_per_year),
+            Duration::from_micros(1000 * 1000 / 160) * ticks_per_slot
+        );
+        assert_eq!(
+            slot_duration_from_slots_per_year(0.0),
+            Duration::from_micros(0) * ticks_per_slot
+        );
+
+        let slots_per_year = SECONDS_PER_YEAR;
+        let ticks_per_slot = 1;
+        assert_eq!(
+            slot_duration_from_slots_per_year(slots_per_year),
+            Duration::from_millis(1000) * ticks_per_slot
+        );
+    }
+}

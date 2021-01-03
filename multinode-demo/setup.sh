@@ -5,28 +5,47 @@ here=$(dirname "$0")
 source "$here"/common.sh
 
 set -e
-"$here"/clear-config.sh
+
+rm -rf "$SOLANA_CONFIG_DIR"/bootstrap-validator
+mkdir -p "$SOLANA_CONFIG_DIR"/bootstrap-validator
 
 # Create genesis ledger
-$solana_keygen new -o "$SOLANA_CONFIG_DIR"/mint-keypair.json
-$solana_keygen new -o "$SOLANA_CONFIG_DIR"/bootstrap-leader-keypair.json
-$solana_keygen new -o "$SOLANA_CONFIG_DIR"/bootstrap-leader-vote-keypair.json
-$solana_keygen new -o "$SOLANA_CONFIG_DIR"/bootstrap-leader-stake-keypair.json
-$solana_keygen new -o "$SOLANA_CONFIG_DIR"/bootstrap-leader-storage-keypair.json
+if [[ -r $FAUCET_KEYPAIR ]]; then
+  cp -f "$FAUCET_KEYPAIR" "$SOLANA_CONFIG_DIR"/faucet.json
+else
+  $solana_keygen new --no-passphrase -fso "$SOLANA_CONFIG_DIR"/faucet.json
+fi
 
-args=("$@")
-default_arg --bootstrap-leader-keypair "$SOLANA_CONFIG_DIR"/bootstrap-leader-keypair.json
-default_arg --bootstrap-vote-keypair "$SOLANA_CONFIG_DIR"/bootstrap-leader-vote-keypair.json
-default_arg --bootstrap-stake-keypair "$SOLANA_CONFIG_DIR"/bootstrap-leader-stake-keypair.json
-default_arg --bootstrap-storage-keypair "$SOLANA_CONFIG_DIR"/bootstrap-leader-storage-keypair.json
-default_arg --ledger "$SOLANA_RSYNC_CONFIG_DIR"/ledger
-default_arg --mint "$SOLANA_CONFIG_DIR"/mint-keypair.json
-default_arg --lamports 100000000000000
-default_arg --bootstrap-leader-lamports 424242
-default_arg --target-lamports-per-signature 42
-default_arg --target-signatures-per-slot 42
+if [[ -f $BOOTSTRAP_VALIDATOR_IDENTITY_KEYPAIR ]]; then
+  cp -f "$BOOTSTRAP_VALIDATOR_IDENTITY_KEYPAIR" "$SOLANA_CONFIG_DIR"/bootstrap-validator/identity.json
+else
+  $solana_keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/bootstrap-validator/identity.json
+fi
+
+$solana_keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/bootstrap-validator/vote-account.json
+$solana_keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/bootstrap-validator/stake-account.json
+
+args=(
+  "$@"
+  --max-genesis-archive-unpacked-size 1073741824
+  --enable-warmup-epochs
+  --bootstrap-validator "$SOLANA_CONFIG_DIR"/bootstrap-validator/identity.json
+                        "$SOLANA_CONFIG_DIR"/bootstrap-validator/vote-account.json
+                        "$SOLANA_CONFIG_DIR"/bootstrap-validator/stake-account.json
+)
+
+"$SOLANA_ROOT"/fetch-spl.sh
+if [[ -r spl-genesis-args.sh ]]; then
+  SPL_GENESIS_ARGS=$(cat "$SOLANA_ROOT"/spl-genesis-args.sh)
+  #shellcheck disable=SC2207
+  #shellcheck disable=SC2206
+  args+=($SPL_GENESIS_ARGS)
+fi
+
+default_arg --ledger "$SOLANA_CONFIG_DIR"/bootstrap-validator
+default_arg --faucet-pubkey "$SOLANA_CONFIG_DIR"/faucet.json
+default_arg --faucet-lamports 500000000000000000
 default_arg --hashes-per-tick auto
-$solana_genesis "${args[@]}"
+default_arg --cluster-type development
 
-test -d "$SOLANA_RSYNC_CONFIG_DIR"/ledger
-cp -a "$SOLANA_RSYNC_CONFIG_DIR"/ledger "$SOLANA_CONFIG_DIR"/bootstrap-leader-ledger
+$solana_genesis "${args[@]}"

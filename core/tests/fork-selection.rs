@@ -1,6 +1,6 @@
 //! Fork Selection Simulation
 //!
-//! Description of the algorithm can be found in [book/src/fork-selection.md](book/src/fork-selection.md).
+//! Description of the algorithm can be found in [docs/src/fork-selection.md](docs/src/fork-selection.md).
 //!
 //! A test library function exists for configuring networks.
 //! ```
@@ -74,8 +74,7 @@
 
 extern crate rand;
 use rand::{thread_rng, Rng};
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Default, Debug, Hash, Eq, PartialEq)]
 pub struct Fork {
@@ -129,7 +128,7 @@ impl Vote {
 }
 
 #[derive(Debug)]
-pub struct LockTower {
+pub struct Tower {
     votes: VecDeque<Vote>,
     max_size: usize,
     fork_trunk: Fork,
@@ -139,7 +138,7 @@ pub struct LockTower {
     parasite: bool,
 }
 
-impl LockTower {
+impl Tower {
     pub fn new(max_size: usize, converge_depth: usize, delay_count: usize) -> Self {
         Self {
             votes: VecDeque::new(),
@@ -175,9 +174,9 @@ impl LockTower {
             }
         }
         let trunk = self.votes.get(self.converge_depth).cloned();
-        trunk.map(|t| {
+        if let Some(t) = trunk {
             self.delayed_votes.retain(|v| v.fork.id > t.fork.id);
-        });
+        }
     }
     pub fn pop_best_votes(
         &mut self,
@@ -191,7 +190,7 @@ impl LockTower {
             .map(|(i, v)| (*scores.get(&v).unwrap_or(&0), v.time, i))
             .collect();
         // highest score, latest vote first
-        best.sort();
+        best.sort_unstable();
         if self.parasite {
             best.reverse();
         }
@@ -361,11 +360,12 @@ fn test_is_trunk_of_4() {
     assert!(!b2.is_trunk_of(&b1, &tree));
 }
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn test_push_vote() {
     let tree = HashMap::new();
     let bmap = HashMap::new();
     let b0 = Fork { id: 0, base: 0 };
-    let mut tower = LockTower::new(32, 7, 0);
+    let mut tower = Tower::new(32, 7, 0);
     let vote = Vote::new(b0.clone(), 0);
     assert!(tower.push_vote(vote, &tree, &bmap));
     assert_eq!(tower.votes.len(), 1);
@@ -396,7 +396,7 @@ fn test_push_vote() {
     assert_eq!(tower.votes[0].lockout, 2);
 
     let b1 = Fork { id: 1, base: 1 };
-    let vote = Vote::new(b1.clone(), 8);
+    let vote = Vote::new(b1, 8);
     assert!(!tower.push_vote(vote, &tree, &bmap));
 
     let vote = Vote::new(b0.clone(), 8);
@@ -408,17 +408,16 @@ fn test_push_vote() {
     assert_eq!(tower.votes[2].lockout, 8);
     assert_eq!(tower.votes[3].lockout, 16);
 
-    let vote = Vote::new(b0.clone(), 10);
+    let vote = Vote::new(b0, 10);
     assert!(tower.push_vote(vote, &tree, &bmap));
     assert_eq!(tower.votes.len(), 2);
     assert_eq!(tower.votes[0].lockout, 2);
     assert_eq!(tower.votes[1].lockout, 16);
 }
 
-fn create_towers(sz: usize, height: usize, delay_count: usize) -> Vec<LockTower> {
+fn create_towers(sz: usize, height: usize, delay_count: usize) -> Vec<Tower> {
     (0..sz)
-        .into_iter()
-        .map(|_| LockTower::new(32, height, delay_count))
+        .map(|_| Tower::new(32, height, delay_count))
         .collect()
 }
 
@@ -438,10 +437,7 @@ fn calc_fork_depth(fork_tree: &HashMap<usize, Fork>, id: usize) -> usize {
 /// map of `fork id` to `tower count`
 /// This map contains the number of nodes that have the fork as an ancestor.
 /// The fork with the highest count that is the newest is the cluster "trunk".
-fn calc_fork_map(
-    towers: &Vec<LockTower>,
-    fork_tree: &HashMap<usize, Fork>,
-) -> HashMap<usize, usize> {
+fn calc_fork_map(towers: &[Tower], fork_tree: &HashMap<usize, Fork>) -> HashMap<usize, usize> {
     let mut lca_map: HashMap<usize, usize> = HashMap::new();
     for tower in towers {
         let mut start = tower.last_fork();
@@ -463,7 +459,7 @@ fn calc_newest_trunk(bmap: &HashMap<usize, usize>) -> (usize, usize) {
     data.last().map(|v| (*v.0, *v.1)).unwrap()
 }
 /// how common is the latest fork of all the nodes
-fn calc_tip_converged(towers: &Vec<LockTower>, bmap: &HashMap<usize, usize>) -> usize {
+fn calc_tip_converged(towers: &[Tower], bmap: &HashMap<usize, usize>) -> usize {
     let sum: usize = towers
         .iter()
         .map(|n| *bmap.get(&n.last_fork().id).unwrap_or(&0))
@@ -498,7 +494,7 @@ fn test_no_partitions() {
 /// * num_partitions - 1 to 100 partitions
 /// * fail_rate - 0 to 1.0 rate of packet receive failure
 /// * delay_count - number of forks to observe before voting
-/// * parasite_rate - number of parasite nodes that vote oposite the greedy choice
+/// * parasite_rate - number of parasite nodes that vote opposite the greedy choice
 fn test_with_partitions(
     num_partitions: usize,
     fail_rate: f64,

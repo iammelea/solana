@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 #
-# This script is to be run on the bootstrap full node
+# This script is to be run on the bootstrap validator
 #
 
 cd "$(dirname "$0")"/../..
@@ -25,8 +25,9 @@ missing() {
 [[ -n $updatePlatform ]] || missing updatePlatform
 [[ -f update_manifest_keypair.json ]] || missing update_manifest_keypair.json
 
-RUST_LOG="$2"
-export RUST_LOG=${RUST_LOG:-solana=info} # if RUST_LOG is unset, default to info
+if [[ -n $2 ]]; then
+  export RUST_LOG="$2"
+fi
 
 source net/common.sh
 loadConfigFile
@@ -34,4 +35,6 @@ loadConfigFile
 PATH="$HOME"/.cargo/bin:"$PATH"
 
 set -x
-scripts/solana-install-deploy.sh localhost "$releaseChannel" "$updatePlatform"
+scripts/solana-install-deploy.sh \
+  --keypair config/faucet.json \
+  localhost "$releaseChannel" "$updatePlatform"

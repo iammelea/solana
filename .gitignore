@@ -1,6 +1,7 @@
-/book/html/
-/book/src/img/
-/book/src/tests.ok
+/docs/html/
+/docs/src/tests.ok
+/docs/src/cli/usage.md
+/docs/src/.gitbook/assets/*.svg
 /farf/
 /solana-release/
 /solana-release.tar.bz2
@@ -11,15 +12,22 @@
 **/*.rs.bk
 .cargo
 
-# node config that is rsynced
 /config/
-# node config that remains local
-/config-local/
+
+.cache
 
 # log files
 *.log
 log-*.txt
+log-*/
 
 # intellij files
 /.idea/
 /solana.iml
+/.vscode/
+
+# fetch-spl.sh artifacts
+/spl-genesis-args.sh
+/spl_*.so
+
+.DS_Store

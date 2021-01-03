@@ -9,6 +9,29 @@ cloud_DefaultZone() {
 }
 
 #
+# cloud_RestartPreemptedInstances [namePrefix]
+#
+# Restart any preempted instances matching the specified prefix
+#
+# namePrefix - The instance name prefix of the preempted instances
+#
+cloud_RestartPreemptedInstances() {
+  declare filter="$1"
+
+  declare name status zone
+  while read -r name status zone; do
+    echo "Starting $status instance: $name"
+    (
+      set -x
+      gcloud compute instances start --zone "$zone" "$name"
+    )
+  done < <(gcloud compute instances list \
+             --filter "$filter" \
+             --format 'value(name,status,zone)' \
+           | grep TERMINATED)
+}
+
+#
 # __cloud_FindInstances
 #
 # Find instances matching the specified pattern.
@@ -36,6 +59,17 @@ __cloud_FindInstances() {
              --filter "$filter" \
              --format 'value(name,networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].networkIP,status,zone)' \
            | grep RUNNING)
+
+  while read -r name status zone; do
+    privateIp=TERMINATED
+    publicIp=TERMINATED
+    printf "%-30s | publicIp=%-16s privateIp=%s status=%s zone=%s\n" "$name" "$publicIp" "$privateIp" "$status" "$zone"
+
+    instances+=("$name:$publicIp:$privateIp:$zone")
+  done < <(gcloud compute instances list \
+             --filter "$filter" \
+             --format 'value(name,status,zone)' \
+           | grep TERMINATED)
 }
 
 #
@@ -88,7 +122,7 @@ cloud_Initialize() {
   declare networkName="$1"
   # ec2-provider.sh creates firewall rules programmatically, should do the same
   # here.
-  echo "TODO: create $networkName firewall rules programmatically instead of assuming the 'testnet' tag exists"
+  echo "Note: one day create $networkName firewall rules programmatically instead of assuming the 'testnet' tag exists"
 }
 
 #
@@ -112,6 +146,9 @@ cloud_Initialize() {
 # address       - Optional name of the GCE static IP address to attach to the
 #                 instance.  Requires that |numNodes| = 1 and that addressName
 #                 has been provisioned in the GCE region that is hosting `$zone`
+# bootDiskType  - Optional specify SSD or HDD boot disk
+# additionalDiskSize - Optional specify size of additional storage volume
+# preemptible - Optionally request a preemptible instance ("true")
 #
 # Tip: use cloud_FindInstances to locate the instances once this function
 #      returns
@@ -125,19 +162,22 @@ cloud_CreateInstances() {
   declare optionalBootDiskSize="$7"
   declare optionalStartupScript="$8"
   declare optionalAddress="$9"
-  declare optionalBootDiskType="${10}"
+  declare optionalBootDiskType="${10:-pd-ssd}"
+  declare optionalAdditionalDiskSize="${11}"
+  declare optionalPreemptible="${12}"
+  #declare sshPrivateKey="${13}"  # unused
 
   if $enableGpu; then
     # Custom Ubuntu 18.04 LTS image with CUDA 9.2 and CUDA 10.0 installed
     #
-    # TODO: Unfortunately this image is not public.  When this becomes an issue,
-    # use the stock Ubuntu 18.04 image and programmatically install CUDA after the
+    # Unfortunately this image is not public.  When this becomes an issue, use
+    # the stock Ubuntu 18.04 image and programmatically install CUDA after the
     # instance boots
     #
-    imageName="ubuntu-1804-bionic-v20181029-with-cuda-10-and-cuda-9-2"
+    imageName="ubuntu-2004-focal-v20201211-with-cuda-10-2 --image-project principal-lane-200702"
   else
-    # Upstream Ubuntu 18.04 LTS image
-    imageName="ubuntu-1804-bionic-v20181029 --image-project ubuntu-os-cloud"
+    # Upstream Ubuntu 20.04 LTS image
+    imageName="ubuntu-2004-focal-v20201201 --image-project ubuntu-os-cloud"
   fi
 
   declare -a nodes
@@ -156,11 +196,16 @@ cloud_CreateInstances() {
     --metadata "testnet=$networkName"
     --image "$imageName"
     --maintenance-policy TERMINATE
-    --no-restart-on-failure
+    --restart-on-failure
+    --scopes compute-rw
   )
 
   # shellcheck disable=SC2206 # Do not want to quote $imageName as it may contain extra args
   args+=(--image $imageName)
+
+  if [[ $optionalPreemptible = true ]]; then
+    args+=(--preemptible)
+  fi
 
   # shellcheck disable=SC2206 # Do not want to quote $machineType as it may contain extra args
   for word in $machineType; do
@@ -198,6 +243,22 @@ cloud_CreateInstances() {
     set -x
     gcloud beta compute instances create "${nodes[@]}" "${args[@]}"
   )
+
+  if [[ -n $optionalAdditionalDiskSize ]]; then
+    if [[ $numNodes = 1 ]]; then
+      (
+        set -x
+        cloud_CreateAndAttachPersistentDisk "${namePrefix}" "$optionalAdditionalDiskSize" "pd-ssd" "$zone"
+      )
+    else
+      for node in $(seq -f "${namePrefix}%0${#numNodes}g" 1 "$numNodes"); do
+        (
+          set -x
+          cloud_CreateAndAttachPersistentDisk "${node}" "$optionalAdditionalDiskSize" "pd-ssd" "$zone"
+        )
+      done
+    fi
+  fi
 }
 
 #
@@ -234,6 +295,9 @@ cloud_WaitForInstanceReady() {
 #  declare instanceZone="$3"
   declare timeout="$4"
 
+  if [[ $instanceIp = "TERMINATED" ]]; then
+    return 1
+  fi
   timeout "${timeout}"s bash -c "set -o pipefail; until ping -c 3 $instanceIp | tr - _; do echo .; done"
 }
 
@@ -251,8 +315,48 @@ cloud_FetchFile() {
   declare localFile="$4"
   declare zone="$5"
 
+  if [[ $publicIp = "TERMINATED" ]]; then
+    return 1
+  fi
+
   (
     set -x
     gcloud compute scp --zone "$zone" "$instanceName:$remoteFile" "$localFile"
   )
+}
+
+#
+# cloud_CreateAndAttachPersistentDisk [instanceName] [diskSize] [diskType]
+#
+# Create a persistent disk and attach it to a pre-existing VM instance.
+# Set disk to auto-delete upon instance deletion
+#
+cloud_CreateAndAttachPersistentDisk() {
+  declare instanceName="$1"
+  declare diskSize="$2"
+  declare diskType="$3"
+  declare zone="$4"
+  diskName="${instanceName}-pd"
+
+  gcloud beta compute disks create "$diskName" \
+    --size "$diskSize" \
+    --type "$diskType" \
+    --zone "$zone"
+
+  gcloud compute instances attach-disk "$instanceName" \
+    --disk "$diskName" \
+    --zone "$zone"
+
+  gcloud compute instances set-disk-auto-delete "$instanceName" \
+    --disk "$diskName" \
+    --zone "$zone" \
+    --auto-delete
+}
+
+#
+# cloud_StatusAll
+#
+# Not yet implemented for this cloud provider
+cloud_StatusAll() {
+  echo "ERROR: cloud_StatusAll is not yet implemented for GCE"
 }

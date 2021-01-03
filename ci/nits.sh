@@ -18,21 +18,25 @@ declare prints=(
 
 # Parts of the tree that are expected to be print free
 declare print_free_tree=(
-  'core/src'
-  'drone/src'
-  'metrics/src'
-  'netutil/src'
-  'runtime/src'
-  'sdk/bpf/rust/rust-utils'
-  'sdk/src'
-  'programs/bpf/rust'
-  'programs/stake_api/src'
-  'programs/stake_program/src'
-  'programs/vote_api/src'
-  'programs/vote_program/src'
+  ':core/src/**.rs'
+  ':faucet/src/**.rs'
+  ':ledger/src/**.rs'
+  ':metrics/src/**.rs'
+  ':net-utils/src/**.rs'
+  ':runtime/src/**.rs'
+  ':sdk/bpf/rust/rust-utils/**.rs'
+  ':sdk/**.rs'
+  ':^sdk/cargo-build-bpf/**.rs'
+  ':^sdk/program/src/program_option.rs'
+  ':^sdk/program/src/program_stubs.rs'
+  ':programs/**.rs'
+  ':^**bin**.rs'
+  ':^**bench**.rs'
+  ':^**test**.rs'
+  ':^**/build.rs'
 )
 
-if _ git --no-pager grep -n --max-depth=0 "${prints[@]/#/-e }" -- "${print_free_tree[@]}"; then
+if _ git --no-pager grep -n "${prints[@]/#/-e}" -- "${print_free_tree[@]}"; then
     exit 1
 fi
 
@@ -45,17 +49,26 @@ if _ git --no-pager grep -n 'Default::default()' -- '*.rs'; then
     exit 1
 fi
 
-# Let's keep a .gitignore for every crate, ensure it's got
-#  /target/ in it
-declare gitignores_ok=true
-for i in $(git --no-pager ls-files \*/Cargo.toml ); do
-  dir=$(dirname "$i")
-  if [[ ! -f $dir/.gitignore ]]; then
-      echo 'error: nits.sh .gitnore missing for crate '"$dir" >&2
-      gitignores_ok=false
-  elif ! grep -q -e '^/target/$' "$dir"/.gitignore; then
-      echo 'error: nits.sh "/target/" apparently missing from '"$dir"'/.gitignore' >&2
-      gitignores_ok=false
-  fi
-done
-"$gitignores_ok"
+
+# Github Issues should be used to track outstanding work items instead of
+# marking up the code
+#
+# Ref: https://github.com/solana-labs/solana/issues/6474
+#
+# shellcheck disable=1001
+declare useGithubIssueInsteadOf=(
+  X\XX
+  T\BD
+  F\IXME
+  #T\ODO  # TODO: Disable TODOs once all other TODOs are purged
+)
+
+if _ git --no-pager grep -n --max-depth=0 "${useGithubIssueInsteadOf[@]/#/-e }" -- '*.rs' '*.sh' '*.md'; then
+    exit 1
+fi
+
+# TODO: Remove this `git grep` once TODOs are banned above
+#       (this command is only used to highlight the current offenders)
+_ git --no-pager grep -n --max-depth=0 "-e TODO" -- '*.rs' '*.sh' '*.md' || true
+echo "^^^ +++"
+# END TODO

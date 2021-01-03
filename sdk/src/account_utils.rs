@@ -1,15 +1,18 @@
 //! useful extras for Account state
-use crate::account::{Account, KeyedAccount};
-use crate::instruction::InstructionError;
+use crate::{account::Account, instruction::InstructionError};
 use bincode::ErrorKind;
 
 /// Convenience trait to covert bincode errors to instruction errors.
-pub trait State<T> {
+pub trait StateMut<T> {
     fn state(&self) -> Result<T, InstructionError>;
     fn set_state(&mut self, state: &T) -> Result<(), InstructionError>;
 }
+pub trait State<T> {
+    fn state(&self) -> Result<T, InstructionError>;
+    fn set_state(&self, state: &T) -> Result<(), InstructionError>;
+}
 
-impl<T> State<T> for Account
+impl<T> StateMut<T> for Account
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
@@ -25,23 +28,10 @@ where
     }
 }
 
-impl<'a, T> State<T> for KeyedAccount<'a>
-where
-    T: serde::Serialize + serde::de::DeserializeOwned,
-{
-    fn state(&self) -> Result<T, InstructionError> {
-        self.account.state()
-    }
-    fn set_state(&mut self, state: &T) -> Result<(), InstructionError> {
-        self.account.set_state(state)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::Account;
-    use crate::pubkey::Pubkey;
+    use crate::{account::Account, pubkey::Pubkey};
 
     #[test]
     fn test_account_state() {
@@ -57,5 +47,4 @@ mod tests {
         let stored_state: u64 = account.state().unwrap();
         assert_eq!(stored_state, state);
     }
-
 }

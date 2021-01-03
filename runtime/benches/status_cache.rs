@@ -4,8 +4,10 @@ extern crate test;
 
 use bincode::serialize;
 use solana_runtime::status_cache::*;
-use solana_sdk::hash::{hash, Hash};
-use solana_sdk::signature::Signature;
+use solana_sdk::{
+    hash::{hash, Hash},
+    signature::Signature,
+};
 use test::Bencher;
 
 type BankStatusCache = StatusCache<()>;
@@ -28,6 +30,6 @@ fn test_statuscache_serialize(bencher: &mut Bencher) {
         }
     }
     bencher.iter(|| {
-        let _ = serialize(&status_cache).unwrap();
+        let _ = serialize(&status_cache.slot_deltas(&[0])).unwrap();
     });
 }

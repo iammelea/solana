@@ -9,8 +9,9 @@ if [[ -n $APPVEYOR ]]; then
   source ci/rust-version.sh
 
   appveyor DownloadFile https://win.rustup.rs/ -FileName rustup-init.exe
+  export USERPROFILE="D:\\"
   ./rustup-init -yv --default-toolchain $rust_stable --default-host x86_64-pc-windows-msvc
-  export PATH="$PATH:$USERPROFILE/.cargo/bin"
+  export PATH="$PATH:/d/.cargo/bin"
   rustc -vV
   cargo -vV
 fi
@@ -32,32 +33,43 @@ else
 fi
 
 if [[ -z $CHANNEL_OR_TAG ]]; then
-  echo Unable to determine channel to publish into, exiting.
-  exit 1
+  echo +++ Unable to determine channel or tag to publish into, exiting.
+  exit 0
 fi
 
-PERF_LIBS=false
 case "$CI_OS_NAME" in
 osx)
   TARGET=x86_64-apple-darwin
   ;;
 linux)
   TARGET=x86_64-unknown-linux-gnu
-  PERF_LIBS=true
   ;;
 windows)
   TARGET=x86_64-pc-windows-msvc
+  # Enable symlinks used by some build.rs files
+  # source: https://stackoverflow.com/a/52097145/10242004
+  (
+    set -x
+    git --version
+    git config core.symlinks true
+    find . -type l -delete
+    git reset --hard
+  )
   ;;
 *)
-  TARGET=unknown-unknown-unknown
+  echo CI_OS_NAME unset
+  exit 1
   ;;
 esac
 
-echo --- Creating tarball
+RELEASE_BASENAME="${RELEASE_BASENAME:=solana-release}"
+TARBALL_BASENAME="${TARBALL_BASENAME:="$RELEASE_BASENAME"}"
+
+echo --- Creating release tarball
 (
   set -x
-  rm -rf solana-release/
-  mkdir solana-release/
+  rm -rf "${RELEASE_BASENAME:?}"/
+  mkdir "${RELEASE_BASENAME}"/
 
   COMMIT="$(git rev-parse HEAD)"
 
@@ -65,86 +77,46 @@ echo --- Creating tarball
     echo "channel: $CHANNEL_OR_TAG"
     echo "commit: $COMMIT"
     echo "target: $TARGET"
-  ) > solana-release/version.yml
+  ) > "${RELEASE_BASENAME}"/version.yml
+
+  # Make CHANNEL available to include in the software version information
+  export CHANNEL
 
   source ci/rust-version.sh stable
-  scripts/cargo-install-all.sh +"$rust_stable" solana-release
+  scripts/cargo-install-all.sh +"$rust_stable" "${RELEASE_BASENAME}"
 
-  if $PERF_LIBS; then
-    rm -rf target/perf-libs
-    ./fetch-perf-libs.sh
-    mkdir solana-release/target
-    cp -a target/perf-libs solana-release/target/
-
-    # shellcheck source=/dev/null
-    source ./target/perf-libs/env.sh
-    (
-      cd validator
-      cargo +"$rust_stable" install --path . --features=cuda --root ../solana-release-cuda
-    )
-    cp solana-release-cuda/bin/solana-validator solana-release/bin/solana-validator-cuda
-  fi
-
-  cp -a scripts multinode-demo solana-release/
-
-  # Add a wrapper script for validator.sh
-  # TODO: Remove multinode/... from tarball
-  cat > solana-release/bin/validator.sh <<'EOF'
-#!/usr/bin/env bash
-set -e
-cd "$(dirname "$0")"/..
-export USE_INSTALL=1
-exec multinode-demo/validator.sh "$@"
-EOF
-  chmod +x solana-release/bin/validator.sh
-
-  # Add a wrapper script for clear-config.sh
-  # TODO: Remove multinode/... from tarball
-  cat > solana-release/bin/clear-config.sh <<'EOF'
-#!/usr/bin/env bash
-set -e
-cd "$(dirname "$0")"/..
-export USE_INSTALL=1
-exec multinode-demo/clear-config.sh "$@"
-EOF
-  chmod +x solana-release/bin/clear-config.sh
-
-  tar jvcf solana-release-$TARGET.tar.bz2 solana-release/
-  cp solana-release/bin/solana-install-init solana-install-init-$TARGET
+  tar cvf "${TARBALL_BASENAME}"-$TARGET.tar "${RELEASE_BASENAME}"
+  bzip2 "${TARBALL_BASENAME}"-$TARGET.tar
+  cp "${RELEASE_BASENAME}"/bin/solana-install-init solana-install-init-$TARGET
+  cp "${RELEASE_BASENAME}"/version.yml "${TARBALL_BASENAME}"-$TARGET.yml
 )
 
-# Metrics tarball is platform agnostic, only publish it from Linux
-MAYBE_METRICS_TARBALL=
+# Maybe tarballs are platform agnostic, only publish them from the Linux build
+MAYBE_TARBALLS=
 if [[ "$CI_OS_NAME" = linux ]]; then
-  metrics/create-metrics-tarball.sh
-  MAYBE_METRICS_TARBALL=solana-metrics.tar.bz2
+  (
+    set -x
+    sdk/bpf/scripts/package.sh
+    [[ -f bpf-sdk.tar.bz2 ]]
+  )
+  MAYBE_TARBALLS="bpf-sdk.tar.bz2"
 fi
 
 source ci/upload-ci-artifact.sh
 
-for file in solana-release-$TARGET.tar.bz2 solana-install-init-"$TARGET"* $MAYBE_METRICS_TARBALL; do
-  upload-ci-artifact "$file"
-
+for file in "${TARBALL_BASENAME}"-$TARGET.tar.bz2 "${TARBALL_BASENAME}"-$TARGET.yml solana-install-init-"$TARGET"* $MAYBE_TARBALLS; do
   if [[ -n $DO_NOT_PUBLISH_TAR ]]; then
+    upload-ci-artifact "$file"
     echo "Skipped $file due to DO_NOT_PUBLISH_TAR"
     continue
   fi
 
   if [[ -n $BUILDKITE ]]; then
     echo --- AWS S3 Store: "$file"
-    (
-      set -x
-      $DRYRUN docker run \
-        --rm \
-        --env AWS_ACCESS_KEY_ID \
-        --env AWS_SECRET_ACCESS_KEY \
-        --volume "$PWD:/solana" \
-        eremite/aws-cli:2018.12.18 \
-        /usr/bin/s3cmd --acl-public put /solana/"$file" s3://release.solana.com/"$CHANNEL_OR_TAG"/"$file"
+    upload-s3-artifact "/solana/$file" s3://release.solana.com/"$CHANNEL_OR_TAG"/"$file"
 
-      echo Published to:
-      $DRYRUN ci/format-url.sh http://release.solana.com/"$CHANNEL_OR_TAG"/"$file"
-    )
+    echo Published to:
+    $DRYRUN ci/format-url.sh https://release.solana.com/"$CHANNEL_OR_TAG"/"$file"
 
     if [[ -n $TAG ]]; then
       ci/upload-github-release-asset.sh "$file"
@@ -165,5 +137,23 @@ for file in solana-release-$TARGET.tar.bz2 solana-install-init-"$TARGET"* $MAYBE
     appveyor PushArtifact "$file" -FileName "$CHANNEL_OR_TAG"/"$file"
   fi
 done
+
+
+# Create install wrapper for release.solana.com
+if [[ -n $DO_NOT_PUBLISH_TAR ]]; then
+  echo "Skipping publishing install wrapper"
+elif [[ -n $BUILDKITE ]]; then
+  cat > release.solana.com-install <<EOF
+SOLANA_RELEASE=$CHANNEL_OR_TAG
+SOLANA_INSTALL_INIT_ARGS=$CHANNEL_OR_TAG
+SOLANA_DOWNLOAD_ROOT=http://release.solana.com
+EOF
+  cat install/solana-install-init.sh >> release.solana.com-install
+
+  echo --- AWS S3 Store: "install"
+  $DRYRUN upload-s3-artifact "/solana/release.solana.com-install" "s3://release.solana.com/$CHANNEL_OR_TAG/install"
+  echo Published to:
+  $DRYRUN ci/format-url.sh https://release.solana.com/"$CHANNEL_OR_TAG"/install
+fi
 
 echo --- ok

@@ -1,11 +1,8 @@
-
-# Note: This crate must be built using build.sh
-
 [package]
 name = "solana-bpf-rust-dep-crate"
-version = "0.17.0"
-description = "Solana BPF dep-crate program written in Rust"
-authors = ["Solana Maintainers <maintainers@solana.com>"]
+version = "1.6.0"
+description = "Solana BPF test program written in Rust"
+authors = ["Solana Maintainers <maintainers@solana.foundation>"]
 repository = "https://github.com/solana-labs/solana"
 license = "Apache-2.0"
 homepage = "https://solana.com/"
@@ -13,11 +10,10 @@ edition = "2018"
 
 [dependencies]
 byteorder = { version = "1", default-features = false }
-solana-sdk-bpf-utils = { path = "../../../../sdk/bpf/rust/rust-utils", version = "0.17.0" }
-
-[workspace]
-members = []
+solana-program = { path = "../../../../sdk/program", version = "1.6.0" }
 
 [lib]
 crate-type = ["cdylib"]
-name = "solana_bpf_rust_dep_crate"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]

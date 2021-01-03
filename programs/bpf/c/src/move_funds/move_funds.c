@@ -2,7 +2,6 @@
  * @brief Example C-based BPF program that moves funds from one account to
  * another
  */
-
 #include <solana_sdk.h>
 
 /**
@@ -11,17 +10,17 @@
  */
 #define NUM_KA 3
 
-extern bool entrypoint(const uint8_t *input) {
-  SolKeyedAccount ka[NUM_KA];
+extern uint64_t entrypoint(const uint8_t *input) {
+  SolAccountInfo ka[NUM_KA];
   SolParameters params = (SolParameters) { .ka = ka };
 
   if (!sol_deserialize(input, &params, SOL_ARRAY_SIZE(ka))) {
-    return false;
+    return ERROR_INVALID_ARGUMENT;
   }
 
   if (!params.ka[0].is_signer) {
     sol_log("Transaction not signed by key 0");
-    return false;
+    return ERROR_MISSING_REQUIRED_SIGNATURES;
   }
 
   int64_t lamports = *(int64_t *)params.data;
@@ -32,5 +31,5 @@ extern bool entrypoint(const uint8_t *input) {
   } else {
     // sol_log_64(0, 0, 0xFF, *ka[0].lamports, lamports);
   }
-  return true;
+  return SUCCESS;
 }

@@ -3,27 +3,37 @@
 //! messages to the network directly. The binary encoding of its messages are
 //! unstable and may change in future releases.
 
-use crate::rpc_client::RpcClient;
+use crate::{rpc_client::RpcClient, rpc_config::RpcProgramAccountsConfig, rpc_response::Response};
 use bincode::{serialize_into, serialized_size};
 use log::*;
-use solana_sdk::account::Account;
-use solana_sdk::client::{AsyncClient, Client, SyncClient};
-use solana_sdk::fee_calculator::FeeCalculator;
-use solana_sdk::hash::Hash;
-use solana_sdk::instruction::Instruction;
-use solana_sdk::message::Message;
-use solana_sdk::packet::PACKET_DATA_SIZE;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
-use solana_sdk::system_instruction;
-use solana_sdk::timing::{duration_as_ms, MAX_PROCESSING_AGE};
-use solana_sdk::transaction::{self, Transaction};
-use solana_sdk::transport::Result as TransportResult;
-use std::io;
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use solana_sdk::{
+    account::Account,
+    client::{AsyncClient, Client, SyncClient},
+    clock::{Slot, MAX_PROCESSING_AGE},
+    commitment_config::CommitmentConfig,
+    epoch_info::EpochInfo,
+    fee_calculator::{FeeCalculator, FeeRateGovernor},
+    hash::Hash,
+    instruction::Instruction,
+    message::Message,
+    packet::PACKET_DATA_SIZE,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer},
+    signers::Signers,
+    system_instruction,
+    timing::duration_as_ms,
+    transaction::{self, Transaction},
+    transport::Result as TransportResult,
+};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        RwLock,
+    },
+    time::{Duration, Instant},
+};
 
 struct ClientOptimizer {
     cur_index: AtomicUsize,
@@ -107,21 +117,17 @@ impl ClientOptimizer {
 /// An object for querying and sending transactions to the network.
 pub struct ThinClient {
     transactions_socket: UdpSocket,
-    transactions_addrs: Vec<SocketAddr>,
+    tpu_addrs: Vec<SocketAddr>,
     rpc_clients: Vec<RpcClient>,
     optimizer: ClientOptimizer,
 }
 
 impl ThinClient {
     /// Create a new ThinClient that will interface with the Rpc at `rpc_addr` using TCP
-    /// and the Tpu at `transactions_addr` over `transactions_socket` using UDP.
-    pub fn new(
-        rpc_addr: SocketAddr,
-        transactions_addr: SocketAddr,
-        transactions_socket: UdpSocket,
-    ) -> Self {
+    /// and the Tpu at `tpu_addr` over `transactions_socket` using UDP.
+    pub fn new(rpc_addr: SocketAddr, tpu_addr: SocketAddr, transactions_socket: UdpSocket) -> Self {
         Self::new_from_client(
-            transactions_addr,
+            tpu_addr,
             transactions_socket,
             RpcClient::new_socket(rpc_addr),
         )
@@ -129,47 +135,47 @@ impl ThinClient {
 
     pub fn new_socket_with_timeout(
         rpc_addr: SocketAddr,
-        transactions_addr: SocketAddr,
+        tpu_addr: SocketAddr,
         transactions_socket: UdpSocket,
         timeout: Duration,
     ) -> Self {
         let rpc_client = RpcClient::new_socket_with_timeout(rpc_addr, timeout);
-        Self::new_from_client(transactions_addr, transactions_socket, rpc_client)
+        Self::new_from_client(tpu_addr, transactions_socket, rpc_client)
     }
 
     fn new_from_client(
-        transactions_addr: SocketAddr,
+        tpu_addr: SocketAddr,
         transactions_socket: UdpSocket,
         rpc_client: RpcClient,
     ) -> Self {
         Self {
             transactions_socket,
-            transactions_addrs: vec![transactions_addr],
+            tpu_addrs: vec![tpu_addr],
             rpc_clients: vec![rpc_client],
             optimizer: ClientOptimizer::new(0),
         }
     }
 
     pub fn new_from_addrs(
-        transactions_addrs: Vec<SocketAddr>,
+        rpc_addrs: Vec<SocketAddr>,
+        tpu_addrs: Vec<SocketAddr>,
         transactions_socket: UdpSocket,
-        rpc_sockets: Vec<SocketAddr>,
     ) -> Self {
-        assert!(!transactions_addrs.is_empty());
-        assert!(!rpc_sockets.is_empty());
-        assert_eq!(rpc_sockets.len(), transactions_addrs.len());
-        let rpc_len = rpc_sockets.len();
-        let rpc_clients: Vec<_> = rpc_sockets.into_iter().map(RpcClient::new_socket).collect();
+        assert!(!rpc_addrs.is_empty());
+        assert_eq!(rpc_addrs.len(), tpu_addrs.len());
+
+        let rpc_clients: Vec<_> = rpc_addrs.into_iter().map(RpcClient::new_socket).collect();
+        let optimizer = ClientOptimizer::new(rpc_clients.len());
         Self {
-            transactions_addrs,
+            tpu_addrs,
             transactions_socket,
             rpc_clients,
-            optimizer: ClientOptimizer::new(rpc_len),
+            optimizer,
         }
     }
 
-    fn transactions_addr(&self) -> &SocketAddr {
-        &self.transactions_addrs[self.optimizer.best()]
+    fn tpu_addr(&self) -> &SocketAddr {
+        &self.tpu_addrs[self.optimizer.best()]
     }
 
     fn rpc_client(&self) -> &RpcClient {
@@ -183,7 +189,7 @@ impl ThinClient {
         transaction: &mut Transaction,
         tries: usize,
         min_confirmed_blocks: usize,
-    ) -> io::Result<Signature> {
+    ) -> TransportResult<Signature> {
         self.send_and_confirm_transaction(&[keypair], transaction, tries, min_confirmed_blocks)
     }
 
@@ -193,113 +199,158 @@ impl ThinClient {
         keypair: &Keypair,
         transaction: &mut Transaction,
         tries: usize,
-    ) -> io::Result<Signature> {
+    ) -> TransportResult<Signature> {
         self.send_and_confirm_transaction(&[keypair], transaction, tries, 0)
     }
 
     /// Retry sending a signed Transaction to the server for processing
-    pub fn send_and_confirm_transaction(
+    pub fn send_and_confirm_transaction<T: Signers>(
         &self,
-        keypairs: &[&Keypair],
+        keypairs: &T,
         transaction: &mut Transaction,
         tries: usize,
-        min_confirmed_blocks: usize,
-    ) -> io::Result<Signature> {
+        pending_confirmations: usize,
+    ) -> TransportResult<Signature> {
         for x in 0..tries {
             let now = Instant::now();
             let mut buf = vec![0; serialized_size(&transaction).unwrap() as usize];
             let mut wr = std::io::Cursor::new(&mut buf[..]);
+            let mut num_confirmed = 0;
+            let mut wait_time = MAX_PROCESSING_AGE;
             serialize_into(&mut wr, &transaction)
                 .expect("serialize Transaction in pub fn transfer_signed");
             // resend the same transaction until the transaction has no chance of succeeding
-            while now.elapsed().as_secs() < MAX_PROCESSING_AGE as u64 {
-                self.transactions_socket
-                    .send_to(&buf[..], &self.transactions_addr())?;
-                if self
-                    .poll_for_signature_confirmation(
-                        &transaction.signatures[0],
-                        min_confirmed_blocks,
-                    )
-                    .is_ok()
-                {
-                    return Ok(transaction.signatures[0]);
+            while now.elapsed().as_secs() < wait_time as u64 {
+                if num_confirmed == 0 {
+                    // Send the transaction if there has been no confirmation (e.g. the first time)
+                    self.transactions_socket
+                        .send_to(&buf[..], &self.tpu_addr())?;
+                }
+
+                if let Ok(confirmed_blocks) = self.poll_for_signature_confirmation(
+                    &transaction.signatures[0],
+                    pending_confirmations,
+                ) {
+                    num_confirmed = confirmed_blocks;
+                    if confirmed_blocks >= pending_confirmations {
+                        return Ok(transaction.signatures[0]);
+                    }
+                    // Since network has seen the transaction, wait longer to receive
+                    // all pending confirmations. Resending the transaction could result into
+                    // extra transaction fees
+                    wait_time = wait_time.max(
+                        MAX_PROCESSING_AGE * pending_confirmations.saturating_sub(num_confirmed),
+                    );
                 }
             }
-            info!(
-                "{} tries failed transfer to {}",
-                x,
-                self.transactions_addr()
-            );
-            let (blockhash, _fee_calculator) = self.rpc_client().get_recent_blockhash()?;
+            info!("{} tries failed transfer to {}", x, self.tpu_addr());
+            let (blockhash, _fee_calculator) = self.get_recent_blockhash()?;
             transaction.sign(keypairs, blockhash);
         }
         Err(io::Error::new(
             io::ErrorKind::Other,
             format!("retry_transfer failed in {} retries", tries),
-        ))
+        )
+        .into())
     }
 
-    pub fn poll_balance_with_timeout(
+    pub fn poll_get_balance(&self, pubkey: &Pubkey) -> TransportResult<u64> {
+        self.poll_get_balance_with_commitment(pubkey, CommitmentConfig::default())
+    }
+
+    pub fn poll_get_balance_with_commitment(
         &self,
         pubkey: &Pubkey,
-        polling_frequency: &Duration,
-        timeout: &Duration,
-    ) -> io::Result<u64> {
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<u64> {
         self.rpc_client()
-            .poll_balance_with_timeout(pubkey, polling_frequency, timeout)
-    }
-
-    pub fn poll_get_balance(&self, pubkey: &Pubkey) -> io::Result<u64> {
-        self.rpc_client().poll_get_balance(pubkey)
+            .poll_get_balance_with_commitment(pubkey, commitment_config)
+            .map_err(|e| e.into())
     }
 
     pub fn wait_for_balance(&self, pubkey: &Pubkey, expected_balance: Option<u64>) -> Option<u64> {
-        self.rpc_client().wait_for_balance(pubkey, expected_balance)
+        self.rpc_client().wait_for_balance_with_commitment(
+            pubkey,
+            expected_balance,
+            CommitmentConfig::default(),
+        )
     }
 
-    /// Check a signature in the bank. This method blocks
-    /// until the server sends a response.
-    pub fn check_signature(&self, signature: &Signature) -> bool {
-        self.rpc_client().check_signature(signature)
+    pub fn get_program_accounts_with_config(
+        &self,
+        pubkey: &Pubkey,
+        config: RpcProgramAccountsConfig,
+    ) -> TransportResult<Vec<(Pubkey, Account)>> {
+        self.rpc_client()
+            .get_program_accounts_with_config(pubkey, config)
+            .map_err(|e| e.into())
     }
 
-    pub fn fullnode_exit(&self) -> io::Result<bool> {
-        self.rpc_client().fullnode_exit()
+    pub fn wait_for_balance_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        expected_balance: Option<u64>,
+        commitment_config: CommitmentConfig,
+    ) -> Option<u64> {
+        self.rpc_client().wait_for_balance_with_commitment(
+            pubkey,
+            expected_balance,
+            commitment_config,
+        )
+    }
+
+    pub fn poll_for_signature_with_commitment(
+        &self,
+        signature: &Signature,
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<()> {
+        self.rpc_client()
+            .poll_for_signature_with_commitment(signature, commitment_config)
+            .map_err(|e| e.into())
+    }
+
+    pub fn validator_exit(&self) -> TransportResult<bool> {
+        self.rpc_client().validator_exit().map_err(|e| e.into())
     }
 
     pub fn get_num_blocks_since_signature_confirmation(
         &mut self,
         sig: &Signature,
-    ) -> io::Result<usize> {
+    ) -> TransportResult<usize> {
         self.rpc_client()
             .get_num_blocks_since_signature_confirmation(sig)
+            .map_err(|e| e.into())
     }
 }
 
 impl Client for ThinClient {
-    fn transactions_addr(&self) -> String {
-        self.transactions_addr().to_string()
+    fn tpu_addr(&self) -> String {
+        self.tpu_addr().to_string()
     }
 }
 
 impl SyncClient for ThinClient {
-    fn send_message(&self, keypairs: &[&Keypair], message: Message) -> TransportResult<Signature> {
+    fn send_and_confirm_message<T: Signers>(
+        &self,
+        keypairs: &T,
+        message: Message,
+    ) -> TransportResult<Signature> {
         let (blockhash, _fee_calculator) = self.get_recent_blockhash()?;
-        let mut transaction = Transaction::new(&keypairs, message, blockhash);
+        let mut transaction = Transaction::new(keypairs, message, blockhash);
         let signature = self.send_and_confirm_transaction(keypairs, &mut transaction, 5, 0)?;
         Ok(signature)
     }
 
-    fn send_instruction(
+    fn send_and_confirm_instruction(
         &self,
         keypair: &Keypair,
         instruction: Instruction,
     ) -> TransportResult<Signature> {
-        let message = Message::new(vec![instruction]);
-        self.send_message(&[keypair], message)
+        let message = Message::new(&[instruction], Some(&keypair.pubkey()));
+        self.send_and_confirm_message(&[keypair], message)
     }
 
-    fn transfer(
+    fn transfer_and_confirm(
         &self,
         lamports: u64,
         keypair: &Keypair,
@@ -307,7 +358,7 @@ impl SyncClient for ThinClient {
     ) -> TransportResult<Signature> {
         let transfer_instruction =
             system_instruction::transfer(&keypair.pubkey(), pubkey, lamports);
-        self.send_instruction(keypair, transfer_instruction)
+        self.send_and_confirm_instruction(keypair, transfer_instruction)
     }
 
     fn get_account_data(&self, pubkey: &Pubkey) -> TransportResult<Option<Vec<u8>>> {
@@ -315,28 +366,85 @@ impl SyncClient for ThinClient {
     }
 
     fn get_account(&self, pubkey: &Pubkey) -> TransportResult<Option<Account>> {
-        Ok(self.rpc_client().get_account(pubkey).ok())
+        let account = self.rpc_client().get_account(pubkey);
+        match account {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn get_account_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<Option<Account>> {
+        self.rpc_client()
+            .get_account_with_commitment(pubkey, commitment_config)
+            .map_err(|e| e.into())
+            .map(|r| r.value)
     }
 
     fn get_balance(&self, pubkey: &Pubkey) -> TransportResult<u64> {
-        let balance = self.rpc_client().get_balance(pubkey)?;
-        Ok(balance)
+        self.rpc_client().get_balance(pubkey).map_err(|e| e.into())
+    }
+
+    fn get_balance_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<u64> {
+        self.rpc_client()
+            .get_balance_with_commitment(pubkey, commitment_config)
+            .map_err(|e| e.into())
+            .map(|r| r.value)
+    }
+
+    fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> TransportResult<u64> {
+        self.rpc_client()
+            .get_minimum_balance_for_rent_exemption(data_len)
+            .map_err(|e| e.into())
     }
 
     fn get_recent_blockhash(&self) -> TransportResult<(Hash, FeeCalculator)> {
+        let (blockhash, fee_calculator, _last_valid_slot) =
+            self.get_recent_blockhash_with_commitment(CommitmentConfig::default())?;
+        Ok((blockhash, fee_calculator))
+    }
+
+    fn get_recent_blockhash_with_commitment(
+        &self,
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<(Hash, FeeCalculator, Slot)> {
         let index = self.optimizer.experiment();
         let now = Instant::now();
-        let recent_blockhash = self.rpc_clients[index].get_recent_blockhash();
+        let recent_blockhash =
+            self.rpc_clients[index].get_recent_blockhash_with_commitment(commitment_config);
         match recent_blockhash {
-            Ok(recent_blockhash) => {
+            Ok(Response { value, .. }) => {
                 self.optimizer.report(index, duration_as_ms(&now.elapsed()));
-                Ok(recent_blockhash)
+                Ok((value.0, value.1, value.2))
             }
             Err(e) => {
                 self.optimizer.report(index, std::u64::MAX);
-                Err(e)?
+                Err(e.into())
             }
         }
+    }
+
+    fn get_fee_calculator_for_blockhash(
+        &self,
+        blockhash: &Hash,
+    ) -> TransportResult<Option<FeeCalculator>> {
+        self.rpc_client()
+            .get_fee_calculator_for_blockhash(blockhash)
+            .map_err(|e| e.into())
+    }
+
+    fn get_fee_rate_governor(&self) -> TransportResult<FeeRateGovernor> {
+        self.rpc_client()
+            .get_fee_rate_governor()
+            .map_err(|e| e.into())
+            .map(|r| r.value)
     }
 
     fn get_signature_status(
@@ -345,7 +453,24 @@ impl SyncClient for ThinClient {
     ) -> TransportResult<Option<transaction::Result<()>>> {
         let status = self
             .rpc_client()
-            .get_signature_status(&signature.to_string())
+            .get_signature_status(&signature)
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("send_transaction failed with error {:?}", err),
+                )
+            })?;
+        Ok(status)
+    }
+
+    fn get_signature_status_with_commitment(
+        &self,
+        signature: &Signature,
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<Option<transaction::Result<()>>> {
+        let status = self
+            .rpc_client()
+            .get_signature_status_with_commitment(&signature, commitment_config)
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::Other,
@@ -356,13 +481,27 @@ impl SyncClient for ThinClient {
     }
 
     fn get_slot(&self) -> TransportResult<u64> {
-        let slot = self.rpc_client().get_slot().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("send_transaction failed with error {:?}", err),
-            )
-        })?;
+        self.get_slot_with_commitment(CommitmentConfig::default())
+    }
+
+    fn get_slot_with_commitment(
+        &self,
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<u64> {
+        let slot = self
+            .rpc_client()
+            .get_slot_with_commitment(commitment_config)
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("send_transaction failed with error {:?}", err),
+                )
+            })?;
         Ok(slot)
+    }
+
+    fn get_epoch_info(&self) -> TransportResult<EpochInfo> {
+        self.rpc_client().get_epoch_info().map_err(|e| e.into())
     }
 
     fn get_transaction_count(&self) -> TransportResult<u64> {
@@ -375,7 +514,28 @@ impl SyncClient for ThinClient {
             }
             Err(e) => {
                 self.optimizer.report(index, std::u64::MAX);
-                Err(e)?
+                Err(e.into())
+            }
+        }
+    }
+
+    fn get_transaction_count_with_commitment(
+        &self,
+        commitment_config: CommitmentConfig,
+    ) -> TransportResult<u64> {
+        let index = self.optimizer.experiment();
+        let now = Instant::now();
+        match self
+            .rpc_client()
+            .get_transaction_count_with_commitment(commitment_config)
+        {
+            Ok(transaction_count) => {
+                self.optimizer.report(index, duration_as_ms(&now.elapsed()));
+                Ok(transaction_count)
+            }
+            Err(e) => {
+                self.optimizer.report(index, std::u64::MAX);
+                Err(e.into())
             }
         }
     }
@@ -385,40 +545,43 @@ impl SyncClient for ThinClient {
         &self,
         signature: &Signature,
         min_confirmed_blocks: usize,
-    ) -> TransportResult<()> {
-        Ok(self
-            .rpc_client()
-            .poll_for_signature_confirmation(signature, min_confirmed_blocks)?)
+    ) -> TransportResult<usize> {
+        self.rpc_client()
+            .poll_for_signature_confirmation(signature, min_confirmed_blocks)
+            .map_err(|e| e.into())
     }
 
     fn poll_for_signature(&self, signature: &Signature) -> TransportResult<()> {
-        Ok(self.rpc_client().poll_for_signature(signature)?)
+        self.rpc_client()
+            .poll_for_signature(signature)
+            .map_err(|e| e.into())
     }
 
     fn get_new_blockhash(&self, blockhash: &Hash) -> TransportResult<(Hash, FeeCalculator)> {
-        let new_blockhash = self.rpc_client().get_new_blockhash(blockhash)?;
-        Ok(new_blockhash)
+        self.rpc_client()
+            .get_new_blockhash(blockhash)
+            .map_err(|e| e.into())
     }
 }
 
 impl AsyncClient for ThinClient {
-    fn async_send_transaction(&self, transaction: Transaction) -> io::Result<Signature> {
+    fn async_send_transaction(&self, transaction: Transaction) -> TransportResult<Signature> {
         let mut buf = vec![0; serialized_size(&transaction).unwrap() as usize];
         let mut wr = std::io::Cursor::new(&mut buf[..]);
         serialize_into(&mut wr, &transaction)
             .expect("serialize Transaction in pub fn transfer_signed");
         assert!(buf.len() < PACKET_DATA_SIZE);
         self.transactions_socket
-            .send_to(&buf[..], &self.transactions_addr())?;
+            .send_to(&buf[..], &self.tpu_addr())?;
         Ok(transaction.signatures[0])
     }
-    fn async_send_message(
+    fn async_send_message<T: Signers>(
         &self,
-        keypairs: &[&Keypair],
+        keypairs: &T,
         message: Message,
         recent_blockhash: Hash,
-    ) -> io::Result<Signature> {
-        let transaction = Transaction::new(&keypairs, message, recent_blockhash);
+    ) -> TransportResult<Signature> {
+        let transaction = Transaction::new(keypairs, message, recent_blockhash);
         self.async_send_transaction(transaction)
     }
     fn async_send_instruction(
@@ -426,8 +589,8 @@ impl AsyncClient for ThinClient {
         keypair: &Keypair,
         instruction: Instruction,
         recent_blockhash: Hash,
-    ) -> io::Result<Signature> {
-        let message = Message::new(vec![instruction]);
+    ) -> TransportResult<Signature> {
+        let message = Message::new(&[instruction], Some(&keypair.pubkey()));
         self.async_send_message(&[keypair], message, recent_blockhash)
     }
     fn async_transfer(
@@ -436,7 +599,7 @@ impl AsyncClient for ThinClient {
         keypair: &Keypair,
         pubkey: &Pubkey,
         recent_blockhash: Hash,
-    ) -> io::Result<Signature> {
+    ) -> TransportResult<Signature> {
         let transfer_instruction =
             system_instruction::transfer(&keypair.pubkey(), pubkey, lamports);
         self.async_send_instruction(keypair, transfer_instruction, recent_blockhash)
@@ -444,7 +607,8 @@ impl AsyncClient for ThinClient {
 }
 
 pub fn create_client((rpc, tpu): (SocketAddr, SocketAddr), range: (u16, u16)) -> ThinClient {
-    let (_, transactions_socket) = solana_netutil::bind_in_range(range).unwrap();
+    let (_, transactions_socket) =
+        solana_net_utils::bind_in_range(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), range).unwrap();
     ThinClient::new(rpc, tpu, transactions_socket)
 }
 
@@ -453,7 +617,8 @@ pub fn create_client_with_timeout(
     range: (u16, u16),
     timeout: Duration,
 ) -> ThinClient {
-    let (_, transactions_socket) = solana_netutil::bind_in_range(range).unwrap();
+    let (_, transactions_socket) =
+        solana_net_utils::bind_in_range(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), range).unwrap();
     ThinClient::new_socket_with_timeout(rpc, tpu, transactions_socket, timeout)
 }
 

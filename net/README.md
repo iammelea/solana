@@ -5,7 +5,7 @@ intended to be both dev and CD friendly.
 
 ### User Account Prerequisites
 
-GCP and AWS are supported.
+GCP, AWS, colo are supported.
 
 #### GCP
 First authenticate with
@@ -32,9 +32,10 @@ NOTE: This example uses GCE.  If you are using AWS EC2, replace `./gce.sh` with
 ```bash
 $ cd net/
 $ ./gce.sh create -n 5 -c 1     #<-- Create a GCE testnet with 5 additional nodes (beyond the bootstrap node) and 1 client (billing starts here)
-$ ./init-metrics.sh -c $(whoami)   #<-- Configure a metrics database for the testnet
-$ ./net.sh start                #<-- Deploy the network from the local workspace and start all clients with bench-tps
-$ ./ssh.sh                      #<-- Details on how to ssh into any testnet node to access logs/etc
+$ ./init-metrics.sh $(whoami)   #<-- Recreate a metrics database for the testnet and configure credentials
+$ ./net.sh start                #<-- Deploy the network from the local workspace and start processes on all nodes including bench-tps on the client node
+$ ./ssh.sh                      #<-- Show a help to ssh into any testnet node to access logs/etc
+$ ./net.sh stop                 #<-- Stop running processes on all nodes
 $ ./gce.sh delete               #<-- Dispose of the network (billing stops here)
 ```
 
@@ -73,28 +74,52 @@ $ ./ec2.sh create -g ...
 If deploying a tarball-based network nothing further is required, as GPU presence
 is detected at runtime and the CUDA build is auto selected.
 
-If deploying a locally-built network, first run `./fetch-perf-libs.sh` then
-ensure the `cuda` feature is specified at network start:
-```bash
-$ ./net.sh start -f "cuda"
+### Partition testing
+
+To induce the partition `net.sh netem --config-file <config file path>`
+To remove partition `net.sh netem --config-file <config file path> --netem-cmd cleanup`
+The partitioning is also removed if you do `net.sh stop` or `restart`.
+
+An example config that produces 3 almost equal partitions:
+
 ```
-
-### How to interact with a CD testnet deployed by ci/testnet-deploy.sh
-
-**AWS-Specific Extra Setup**: Follow the steps in `scripts/add-solana-user-authorized_keys.sh`,
-then redeploy the testnet before continuing in this section.
-
-Taking **master-testnet-solana-com** as an example, configure your workspace for
-the testnet using:
-```bash
-$ ./gce.sh config -p master-testnet-solana-com
-```
-or
-```bash
-$ ./ec2.sh config -p master-testnet-solana-com
-```
-
-Then run the following for details on how to ssh into any testnet node to access logs or otherwise inspect the node
-```bash
-$ ./ssh.sh
+{
+      "partitions":[
+         34,
+         33,
+         33
+      ],
+      "interconnects":[
+         {
+            "a":0,
+            "b":1,
+            "config":"loss 15% delay 25ms"
+         },
+         {
+            "a":1,
+            "b":0,
+            "config":"loss 15% delay 25ms"
+         },
+         {
+            "a":0,
+            "b":2,
+            "config":"loss 10% delay 15ms"
+         },
+         {
+            "a":2,
+            "b":0,
+            "config":"loss 10% delay 15ms"
+         },
+         {
+            "a":2,
+            "b":1,
+            "config":"loss 5% delay 5ms"
+         },
+         {
+            "a":1,
+            "b":2,
+            "config":"loss 5% delay 5ms"
+         }
+      ]
+}
 ```

@@ -1,101 +1,117 @@
 [package]
-name = "solana"
+name = "solana-core"
 description = "Blockchain, Rebuilt for Scale"
-version = "0.17.0"
+version = "1.6.0"
 documentation = "https://docs.rs/solana"
 homepage = "https://solana.com/"
 readme = "../README.md"
 repository = "https://github.com/solana-labs/solana"
-authors = ["Solana Maintainers <maintainers@solana.com>"]
+authors = ["Solana Maintainers <maintainers@solana.foundation>"]
 license = "Apache-2.0"
 edition = "2018"
 
 [badges]
 codecov = { repository = "solana-labs/solana", branch = "master", service = "github" }
 
-[features]
-cuda = []
-kvstore = ["solana-kvstore"]
-
 [dependencies]
-bincode = "1.1.4"
-bs58 = "0.2.0"
-byteorder = "1.3.2"
-chrono = { version = "0.4.7", features = ["serde"] }
-core_affinity = "0.5.9"
-crc = { version = "1.8.1", optional = true }
-hashbrown = "0.2.0"
-indexmap = "1.0"
-itertools = "0.8.0"
-jsonrpc-core = "12.0.0"
-jsonrpc-derive = "12.0.0"
-jsonrpc-http-server = "12.0.0"
-jsonrpc-pubsub = "12.0.0"
-jsonrpc-ws-server = "12.0.0"
-libc = "0.2.58"
-log = "0.4.2"
-memmap = { version = "0.7.0", optional = true }
-nix = "0.14.1"
+ahash = "0.6.1"
+base64 = "0.12.3"
+bincode = "1.3.1"
+bv = { version = "0.11.1", features = ["serde"] }
+bs58 = "0.3.1"
+byteorder = "1.3.4"
+chrono = { version = "0.4.11", features = ["serde"] }
+core_affinity = "0.5.10"
+crossbeam-channel = "0.4"
+ed25519-dalek = "=1.0.0-pre.4"
+fs_extra = "1.1.0"
+flate2 = "1.0"
+indexmap = { version = "1.5", features = ["rayon"] }
+itertools = "0.9.0"
+jsonrpc-core = "15.0.0"
+jsonrpc-core-client = { version = "15.0.0", features = ["ws"] }
+jsonrpc-derive = "15.0.0"
+jsonrpc-http-server = "15.0.0"
+jsonrpc-pubsub = "15.0.0"
+jsonrpc-ws-server = "15.0.0"
+log = "0.4.11"
+lru = "0.6.1"
+miow = "0.2.2"
+net2 = "0.2.37"
+num_cpus = "1.13.0"
 num-traits = "0.2"
-rand = "0.6.5"
-rand_chacha = "0.1.1"
-rayon = "1.1.0"
-reqwest = "0.9.18"
-rocksdb = "0.11.0"
-serde = "1.0.93"
-serde_derive = "1.0.93"
-serde_json = "1.0.39"
-solana-budget-api = { path = "../programs/budget_api", version = "0.17.0" }
-solana-budget-program = { path = "../programs/budget_program", version = "0.17.0" }
-solana-chacha-sys = { path = "../chacha-sys", version = "0.17.0" }
-solana-client = { path = "../client", version = "0.17.0" }
-solana-config-program = { path = "../programs/config_program", version = "0.17.0" }
-solana-drone = { path = "../drone", version = "0.17.0" }
-solana-ed25519-dalek = "0.2.0"
-solana-exchange-program = { path = "../programs/exchange_program", version = "0.17.0" }
-solana-kvstore = { path = "../kvstore", version = "0.17.0", optional = true }
-solana-logger = { path = "../logger", version = "0.17.0" }
-solana-merkle-tree = { path = "../merkle-tree", version = "0.17.0" }
-solana-metrics = { path = "../metrics", version = "0.17.0" }
-solana-netutil = { path = "../netutil", version = "0.17.0" }
-solana-runtime = { path = "../runtime", version = "0.17.0" }
-solana-sdk = { path = "../sdk", version = "0.17.0" }
-solana-stake-api = { path = "../programs/stake_api", version = "0.17.0" }
-solana-stake-program = { path = "../programs/stake_program", version = "0.17.0" }
-solana-storage-api = { path = "../programs/storage_api", version = "0.17.0" }
-solana-storage-program = { path = "../programs/storage_program", version = "0.17.0" }
-solana-vote-api = { path = "../programs/vote_api", version = "0.17.0" }
-solana-vote-program = { path = "../programs/vote_program", version = "0.17.0" }
-solana-vote-signer = { path = "../vote-signer", version = "0.17.0" }
-sys-info = "0.5.7"
-tokio = "0.1"
-tokio-codec = "0.1"
-untrusted = "0.6.2"
-
-# reed-solomon-erasure's simd_c feature fails to build for x86_64-pc-windows-msvc, use pure-rust
-[target.'cfg(windows)'.dependencies]
-reed-solomon-erasure = { version = "3.1.1", features = ["pure-rust"] }
-[target.'cfg(not(windows))'.dependencies]
-reed-solomon-erasure = "3.1.1"
+rand = "0.7.0"
+rand_chacha = "0.2.2"
+raptorq = "1.4.2"
+rayon = "1.4.1"
+regex = "1.3.9"
+serde = "1.0.112"
+serde_bytes = "0.11"
+serde_derive = "1.0.103"
+serde_json = "1.0.56"
+solana-account-decoder = { path = "../account-decoder", version = "1.6.0" }
+solana-banks-server = { path = "../banks-server", version = "1.6.0" }
+solana-clap-utils = { path = "../clap-utils", version = "1.6.0" }
+solana-client = { path = "../client", version = "1.6.0" }
+solana-faucet = { path = "../faucet", version = "1.6.0" }
+solana-ledger = { path = "../ledger", version = "1.6.0" }
+solana-logger = { path = "../logger", version = "1.6.0" }
+solana-merkle-tree = { path = "../merkle-tree", version = "1.6.0" }
+solana-metrics = { path = "../metrics", version = "1.6.0" }
+solana-measure = { path = "../measure", version = "1.6.0" }
+solana-net-utils = { path = "../net-utils", version = "1.6.0" }
+solana-perf = { path = "../perf", version = "1.6.0" }
+solana-program-test = { path = "../program-test", version = "1.6.0" }
+solana-runtime = { path = "../runtime", version = "1.6.0" }
+solana-sdk = { path = "../sdk", version = "1.6.0" }
+solana-frozen-abi = { path = "../frozen-abi", version = "1.6.0" }
+solana-frozen-abi-macro = { path = "../frozen-abi/macro", version = "1.6.0" }
+solana-stake-program = { path = "../programs/stake", version = "1.6.0" }
+solana-storage-bigtable = { path = "../storage-bigtable", version = "1.6.0" }
+solana-streamer = { path = "../streamer", version = "1.6.0" }
+solana-sys-tuner = { path = "../sys-tuner", version = "1.6.0" }
+solana-transaction-status = { path = "../transaction-status", version = "1.6.0" }
+solana-version = { path = "../version", version = "1.6.0" }
+solana-vote-program = { path = "../programs/vote", version = "1.6.0" }
+spl-token-v2-0 = { package = "spl-token", version = "=3.0.1", features = ["no-entrypoint"] }
+tempfile = "3.1.0"
+thiserror = "1.0"
+tokio = { version = "0.2", features = ["full"] }
+tokio_01 = { version = "0.1", package = "tokio" }
+tokio_01_bytes = { version = "0.4.7", package = "bytes" }
+tokio_fs_01 = { version = "0.1", package = "tokio-fs" }
+tokio_io_01 = { version = "0.1", package = "tokio-io" }
+tokio_codec_01 = { version = "0.1", package = "tokio-codec" }
+solana-rayon-threadlimit = { path = "../rayon-threadlimit", version = "1.6.0" }
+trees = "0.2.1"
 
 [dev-dependencies]
-hex-literal = "0.2.0"
 matches = "0.1.6"
+reqwest = { version = "0.10.8", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serial_test = "0.4.0"
+serial_test_derive = "0.4.0"
+systemstat = "0.1.5"
+
+[build-dependencies]
+rustc_version = "0.2"
 
 [[bench]]
 name = "banking_stage"
 
 [[bench]]
-name = "blocktree"
+name = "blockstore"
 
 [[bench]]
-name = "ledger"
+name = "crds"
+
+[[bench]]
+name = "crds_gossip_pull"
+
+[[bench]]
+name = "crds_shards"
 
 [[bench]]
 name = "gen_keys"
-
-[[bench]]
-name = "sigverify"
 
 [[bench]]
 name = "sigverify_stage"
@@ -104,5 +120,10 @@ name = "sigverify_stage"
 name = "poh"
 
 [[bench]]
-name = "chacha"
-required-features = ["chacha"]
+name = "retransmit_stage"
+
+[[bench]]
+name = "cluster_info"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]

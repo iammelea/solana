@@ -12,62 +12,67 @@ gce)
   # shellcheck source=net/scripts/gce-provider.sh
   source "$here"/scripts/gce-provider.sh
 
-  cpuBootstrapLeaderMachineType="--machine-type n1-standard-16 --min-cpu-platform Intel%20Skylake"
+  cpuBootstrapLeaderMachineType="--custom-cpu 24 --custom-memory 64GB --min-cpu-platform Intel%20Skylake"
   gpuBootstrapLeaderMachineType="$cpuBootstrapLeaderMachineType --accelerator count=1,type=nvidia-tesla-p100"
-  bootstrapLeaderMachineType=$cpuBootstrapLeaderMachineType
-  fullNodeMachineType=$cpuBootstrapLeaderMachineType
   clientMachineType="--custom-cpu 16 --custom-memory 20GB"
   blockstreamerMachineType="--machine-type n1-standard-8"
-  replicatorMachineType="--custom-cpu 4 --custom-memory 16GB"
+  selfDestructHours=8
   ;;
 ec2)
   # shellcheck source=net/scripts/ec2-provider.sh
   source "$here"/scripts/ec2-provider.sh
 
-  cpuBootstrapLeaderMachineType=c5.2xlarge
+  cpuBootstrapLeaderMachineType=m5.4xlarge
 
   # NOTE: At this time only the p3dn.24xlarge EC2 instance type has GPU and
   #       AVX-512 support.  The default, p2.xlarge, does not support
   #       AVX-512
   gpuBootstrapLeaderMachineType=p2.xlarge
-  bootstrapLeaderMachineType=$cpuBootstrapLeaderMachineType
-  fullNodeMachineType=$cpuBootstrapLeaderMachineType
   clientMachineType=c5.2xlarge
-  blockstreamerMachineType=c5.2xlarge
-  replicatorMachineType=c5.xlarge
+  blockstreamerMachineType=m5.4xlarge
+  selfDestructHours=0
   ;;
 azure)
   # shellcheck source=net/scripts/azure-provider.sh
   source "$here"/scripts/azure-provider.sh
 
-  # TODO: Dial in machine types for Azure
   cpuBootstrapLeaderMachineType=Standard_D16s_v3
   gpuBootstrapLeaderMachineType=Standard_NC12
-  bootstrapLeaderMachineType=$cpuBootstrapLeaderMachineType
-  fullNodeMachineType=$cpuBootstrapLeaderMachineType
   clientMachineType=Standard_D16s_v3
   blockstreamerMachineType=Standard_D16s_v3
-  replicatorMachineType=Standard_D4s_v3
+  selfDestructHours=0
+  ;;
+colo)
+  # shellcheck source=net/scripts/colo-provider.sh
+  source "$here"/scripts/colo-provider.sh
+
+  cpuBootstrapLeaderMachineType=0
+  gpuBootstrapLeaderMachineType=1
+  clientMachineType=0
+  blockstreamerMachineType=0
+  selfDestructHours=0
   ;;
 *)
   echo "Error: Unknown cloud provider: $cloudProvider"
   ;;
 esac
 
-
 prefix=testnet-dev-${USER//[^A-Za-z0-9]/}
-additionalFullNodeCount=2
-clientNodeCount=1
-replicatorNodeCount=0
+additionalValidatorCount=2
+clientNodeCount=0
 blockstreamer=false
-fullNodeBootDiskSizeInGb=1000
+validatorBootDiskSizeInGb=500
 clientBootDiskSizeInGb=75
-replicatorBootDiskSizeInGb=1000
+validatorAdditionalDiskSizeInGb=
 externalNodes=false
 failOnValidatorBootupFailure=true
+preemptible=true
+evalInfo=false
 
 publicNetwork=false
+letsEncryptDomainName=
 enableGpu=false
+customMachineType=
 customAddress=
 zones=()
 
@@ -93,57 +98,146 @@ Manage testnet instances
  config - configure the testnet and write a config file describing it
  delete - delete the testnet
  info   - display information about the currently configured testnet
+ status - display status information of all resources
 
  common options:
    -p [prefix]      - Optional common prefix for instance names to avoid
                       collisions (default: $prefix)
    -z [zone]        - Zone(s) for the nodes (default: $(cloud_DefaultZone))
-                      If specified multiple times, the fullnodes will be evenly
+                      If specified multiple times, the validators will be evenly
                       distributed over all specified zones and
                       client/blockstreamer nodes will be created in the first
                       zone
    -x               - append to the existing configuration instead of creating a
                       new configuration
-   -f               - Discard validator nodes that didn't bootup successfully
+   --allow-boot-failures
+                    - Discard from config validator nodes that didn't bootup
+                      successfully
 
  create-specific options:
-   -n [number]      - Number of additional fullnodes (default: $additionalFullNodeCount)
+   -n [number]      - Number of additional validators (default: $additionalValidatorCount)
    -c [number]      - Number of client nodes (default: $clientNodeCount)
-   -r [number]      - Number of replicator nodes (default: $replicatorNodeCount)
    -u               - Include a Blockstreamer (default: $blockstreamer)
    -P               - Use public network IP addresses (default: $publicNetwork)
-   -g               - Enable GPU (default: $enableGpu)
-   -G               - Enable GPU, and set count/type of GPUs to use
+   -g               - Enable GPU and automatically set validator machine types to $gpuBootstrapLeaderMachineType
+                      (default: $enableGpu)
+   -G               - Enable GPU, and set custom GPU machine type to use
                       (e.g $gpuBootstrapLeaderMachineType)
    -a [address]     - Address to be be assigned to the Blockstreamer if present,
-                      otherwise the bootstrap fullnode.
+                      otherwise the bootstrap validator.
                       * For GCE, [address] is the "name" of the desired External
                         IP Address.
                       * For EC2, [address] is the "allocation ID" of the desired
                         Elastic IP.
    -d [disk-type]   - Specify a boot disk type (default None) Use pd-ssd to get ssd on GCE.
+   --letsencrypt [dns name]
+                    - Attempt to generate a TLS certificate using this
+                      DNS name (useful only when the -a and -P options
+                      are also provided)
+   --custom-machine-type [type]
+                    - Set a custom machine type without assuming whether or not
+                      GPU is enabled.  Set this explicitly with --enable-gpu/-g to call out the presence of GPUs.
+   --enable-gpu     - Use with --custom-machine-type to specify whether or not GPUs should be used/enabled
+   --validator-additional-disk-size-gb [number]
+                    - Add an additional [number] GB SSD to all validators to store the config directory.
+                      If not set, config will be written to the boot disk by default.
+                      Only supported on GCE.
+   --dedicated      - Use dedicated instances for additional validators
+                      (by default preemptible instances are used to reduce
+                      cost).  Note that the bootstrap validator,
+                      blockstreamer and client nodes are always dedicated.
+                      Set this flag on colo to prevent your testnet from being pre-empted by nightly test automation.
+   --self-destruct-hours [number]
+                    - Specify lifetime of the allocated instances in hours. 0 to
+                      disable. Only supported on GCE. (default: $selfDestructHours)
+   --validator-boot-disk-size-gb [number]
+                    - Specify validator boot disk size in gb.
+   --client-machine-type [type]
+                    - custom client machine type
 
  config-specific options:
    -P               - Use public network IP addresses (default: $publicNetwork)
 
  delete-specific options:
-   none
+   --reclaim-preemptible-reservations
+                    - If set, reclaims all reservations on colo nodes that were not created with --dedicated.
+                      This behavior does not filter by testnet name or owner.  Only implemented on colo.
+   --reclaim-all-reservations
+                    - If set, reclaims all reservations on all colo nodes, regardless of owner, pre-emptibility, or creator.
 
  info-specific options:
+   --eval           - Output in a form that can be eval-ed by a shell: eval \$(gce.sh info --eval)
+
    none
 
 EOF
   exit $exitcode
 }
 
-
 command=$1
 [[ -n $command ]] || usage
 shift
-[[ $command = create || $command = config || $command = info || $command = delete ]] ||
+[[ $command = create || $command = config || $command = info || $command = delete || $command = status ]] ||
   usage "Invalid command: $command"
 
-while getopts "h?p:Pn:c:r:z:gG:a:d:uxf" opt; do
+shortArgs=()
+while [[ -n $1 ]]; do
+  if [[ ${1:0:2} = -- ]]; then
+    if [[ $1 = --letsencrypt ]]; then
+      letsEncryptDomainName="$2"
+      shift 2
+    elif [[ $1 = --validator-additional-disk-size-gb ]]; then
+      validatorAdditionalDiskSizeInGb="$2"
+      shift 2
+    elif [[ $1 == --machine-type* || $1 == --custom-cpu* ]]; then # Bypass quoted long args for GPUs
+      shortArgs+=("$1")
+      shift
+    elif [[ $1 == --allow-boot-failures ]]; then
+      failOnValidatorBootupFailure=false
+      shift
+    elif [[ $1 == --dedicated ]]; then
+      preemptible=false
+      shift
+    elif [[ $1 == --eval ]]; then
+      evalInfo=true
+      shift
+    elif [[ $1 == --enable-gpu ]]; then
+      enableGpu=true
+      shift
+    elif [[ $1 = --custom-machine-type ]]; then
+      customMachineType="$2"
+      shift 2
+    elif [[ $1 = --client-machine-type ]]; then
+      clientMachineType="$2"
+      shift 2
+    elif [[ $1 = --validator-boot-disk-size-gb ]]; then
+      validatorBootDiskSizeInGb="$2"
+      shift 2
+    elif [[ $1 == --self-destruct-hours ]]; then
+      maybeTimeout=$2
+      if [[ $maybeTimeout =~ ^[0-9]+$ ]]; then
+        selfDestructHours=$maybeTimeout
+      else
+        echo "  Invalid parameter ($maybeTimeout) to $1"
+        usage 1
+      fi
+      shift 2
+    elif [[ $1 == --reclaim-preemptible-reservations ]]; then
+      reclaimOnlyPreemptibleReservations=true
+      shift
+    elif [[ $1 == --reclaim-all-reservations ]]; then
+      reclaimAllReservations=true
+      shift
+    else
+      usage "Unknown long option: $1"
+    fi
+  else
+    shortArgs+=("$1")
+    shift
+  fi
+done
+
+while getopts "h?p:Pn:c:r:z:gG:a:d:uxf" opt "${shortArgs[@]}"; do
   case $opt in
   h | \?)
     usage
@@ -156,28 +250,20 @@ while getopts "h?p:Pn:c:r:z:gG:a:d:uxf" opt; do
     publicNetwork=true
     ;;
   n)
-    additionalFullNodeCount=$OPTARG
+    additionalValidatorCount=$OPTARG
     ;;
   c)
     clientNodeCount=$OPTARG
-    ;;
-  r)
-    replicatorNodeCount=$OPTARG
     ;;
   z)
     containsZone "$OPTARG" "${zones[@]}" || zones+=("$OPTARG")
     ;;
   g)
     enableGpu=true
-    bootstrapLeaderMachineType=$gpuBootstrapLeaderMachineType
-    fullNodeMachineType=$bootstrapLeaderMachineType
-    blockstreamerMachineType=$bootstrapLeaderMachineType
     ;;
   G)
     enableGpu=true
-    bootstrapLeaderMachineType="$OPTARG"
-    fullNodeMachineType=$bootstrapLeaderMachineType
-    blockstreamerMachineType=$bootstrapLeaderMachineType
+    customMachineType="$OPTARG"
     ;;
   a)
     customAddress=$OPTARG
@@ -191,15 +277,21 @@ while getopts "h?p:Pn:c:r:z:gG:a:d:uxf" opt; do
   x)
     externalNodes=true
     ;;
-  f)
-    failOnValidatorBootupFailure=false
-    ;;
   *)
     usage "unhandled option: $opt"
     ;;
   esac
 done
-shift $((OPTIND - 1))
+
+if [[ -n "$customMachineType" ]] ; then
+  bootstrapLeaderMachineType="$customMachineType"
+elif [[ "$enableGpu" = "true" ]] ; then
+  bootstrapLeaderMachineType="$gpuBootstrapLeaderMachineType"
+else
+  bootstrapLeaderMachineType="$cpuBootstrapLeaderMachineType"
+fi
+validatorMachineType=$bootstrapLeaderMachineType
+blockstreamerMachineType=$bootstrapLeaderMachineType
 
 [[ ${#zones[@]} -gt 0 ]] || zones+=("$(cloud_DefaultZone)")
 
@@ -216,14 +308,35 @@ fi
 case $cloudProvider in
 gce)
   ;;
-ec2)
-  ;;
-azure)
+ec2|azure|colo)
+  if [[ -n $validatorAdditionalDiskSizeInGb ]] ; then
+    usage "Error: --validator-additional-disk-size-gb currently only supported with cloud provider: gce"
+  fi
   ;;
 *)
   echo "Error: Unknown cloud provider: $cloudProvider"
   ;;
 esac
+
+case $cloudProvider in
+  gce | ec2 | azure)
+    maybePreemptible="never preemptible"
+    ;;
+  colo)
+    maybePreemptible=$preemptible
+    ;;
+  *)
+    echo "Error: Unknown cloud provider: $cloudProvider"
+    ;;
+esac
+
+if [[ $reclaimOnlyPreemptibleReservations == "true" && $reclaimAllReservations == "true" ]]; then
+  usage "Cannot set both --reclaim-preemptible-reservations and --reclaim-all-reservations.  Set one or none"
+fi
+
+if [[ -n $reclaimAllReservations || -n $reclaimOnlyPreemptibleReservations ]]; then
+  forceDelete="true"
+fi
 
 # cloud_ForEachInstance [cmd] [extra args to cmd]
 #
@@ -328,11 +441,14 @@ prepareInstancesAndWriteConfigFile() {
 netBasename=$prefix
 publicNetwork=$publicNetwork
 sshPrivateKey=$sshPrivateKey
+letsEncryptDomainName=$letsEncryptDomainName
 EOF
   fi
   touch "$geoipConfigFile"
 
   buildSshOptions
+
+  cloud_RestartPreemptedInstances "$prefix"
 
   fetchPrivateKey() {
     declare nodeName
@@ -353,8 +469,8 @@ EOF
         set -o pipefail
         for i in $(seq 1 60); do
           set -x
-          cloud_FetchFile "$nodeName" "$nodeIp" /solana-id_ecdsa "$sshPrivateKey" "$nodeZone" &&
-            cloud_FetchFile "$nodeName" "$nodeIp" /solana-id_ecdsa.pub "$sshPrivateKey.pub" "$nodeZone" &&
+          cloud_FetchFile "$nodeName" "$nodeIp" /solana-scratch/id_ecdsa "$sshPrivateKey" "$nodeZone" &&
+            cloud_FetchFile "$nodeName" "$nodeIp" /solana-scratch/id_ecdsa.pub "$sshPrivateKey.pub" "$nodeZone" &&
               break
           set +x
 
@@ -378,7 +494,6 @@ EOF
     declare failOnFailure="$6"
     declare arrayName="$7"
 
-    # This check should eventually be moved to cloud provider specific script
     if [ "$publicIp" = "TERMINATED" ] || [ "$privateIp" = "TERMINATED" ]; then
       if $failOnFailure; then
         exit 1
@@ -395,7 +510,7 @@ EOF
       for i in $(seq 1 60); do
         (
           set -x
-          timeout --preserve-status --foreground 20s ssh "${sshOptions[@]}" "$publicIp" "ls -l /.instance-startup-complete"
+          timeout --preserve-status --foreground 20s ssh "${sshOptions[@]}" "$publicIp" "ls -l /solana-scratch/.instance-startup-complete"
         )
         ret=$?
         if [[ $ret -eq 0 ]]; then
@@ -429,28 +544,42 @@ EOF
   }
 
   if $externalNodes; then
-    echo "Bootstrap leader is already configured"
+    echo "Bootstrap validator is already configured"
   else
-    echo "Looking for bootstrap leader instance..."
-    cloud_FindInstance "$prefix-bootstrap-leader"
+    echo "Looking for bootstrap validator instance..."
+    cloud_FindInstance "$prefix-bootstrap-validator"
     [[ ${#instances[@]} -eq 1 ]] || {
-      echo "Unable to find bootstrap leader"
+      echo "Unable to find bootstrap validator"
       exit 1
     }
 
-    echo "fullnodeIpList=()" >> "$configFile"
-    echo "fullnodeIpListPrivate=()" >> "$configFile"
-    cloud_ForEachInstance recordInstanceIp true fullnodeIpList
+    echo "validatorIpList=()" >> "$configFile"
+    echo "validatorIpListPrivate=()" >> "$configFile"
+    cloud_ForEachInstance recordInstanceIp true validatorIpList
   fi
 
-  if [[ $additionalFullNodeCount -gt 0 ]]; then
-    for zone in "${zones[@]}"; do
-      echo "Looking for additional fullnode instances in $zone ..."
-      cloud_FindInstances "$prefix-$zone-fullnode"
-      if [[ ${#instances[@]} -gt 0 ]]; then
-        cloud_ForEachInstance recordInstanceIp "$failOnValidatorBootupFailure" fullnodeIpList
+  if [[ $additionalValidatorCount -gt 0 ]]; then
+    numZones=${#zones[@]}
+    if [[ $additionalValidatorCount -gt $numZones ]]; then
+      numNodesPerZone=$((additionalValidatorCount / numZones))
+      numLeftOverNodes=$((additionalValidatorCount % numZones))
+    else
+      numNodesPerZone=1
+      numLeftOverNodes=0
+    fi
+
+    for ((i=((numZones - 1)); i >= 0; i--)); do
+      zone=${zones[i]}
+      if [[ $i -eq 0 ]]; then
+        numNodesPerZone=$((numNodesPerZone + numLeftOverNodes))
+      fi
+      echo "Looking for additional validator instances in $zone ..."
+      cloud_FindInstances "$prefix-$zone-validator"
+      declare numInstances=${#instances[@]}
+      if [[ $numInstances -ge $numNodesPerZone || ( ! $failOnValidatorBootupFailure && $numInstances -gt 0 ) ]]; then
+        cloud_ForEachInstance recordInstanceIp "$failOnValidatorBootupFailure" validatorIpList
       else
-        echo "Unable to find additional fullnodes"
+        echo "Unable to find additional validators"
         if $failOnValidatorBootupFailure; then
           exit 1
         fi
@@ -478,16 +607,6 @@ EOF
     cloud_ForEachInstance recordInstanceIp true blockstreamerIpList
   }
 
-  if ! $externalNodes; then
-    echo "replicatorIpList=()" >> "$configFile"
-    echo "replicatorIpListPrivate=()" >> "$configFile"
-  fi
-  echo "Looking for replicator instances..."
-  cloud_FindInstances "$prefix-replicator"
-  [[ ${#instances[@]} -eq 0 ]] || {
-    cloud_ForEachInstance recordInstanceIp true replicatorIpList
-  }
-
   echo "Wrote $configFile"
   $metricsWriteDatapoint "testnet-deploy net-config-complete=1"
 }
@@ -495,16 +614,30 @@ EOF
 delete() {
   $metricsWriteDatapoint "testnet-deploy net-delete-begin=1"
 
-  # Filter for all nodes
-  filter="$prefix-"
+  case $cloudProvider in
+    gce | ec2 | azure)
+      # Filter for all nodes
+      filter="$prefix-"
+      ;;
+    colo)
+      if [[ -n $forceDelete ]]; then
+        filter=".*-"
+      else
+        filter="$prefix-"
+      fi
+      ;;
+    *)
+      echo "Error: Unknown cloud provider: $cloudProvider"
+      ;;
+  esac
 
   echo "Searching for instances: $filter"
-  cloud_FindInstances "$filter"
+  cloud_FindInstances "$filter" "$reclaimOnlyPreemptibleReservations"
 
   if [[ ${#instances[@]} -eq 0 ]]; then
     echo "No instances found matching '$filter'"
   else
-    cloud_DeleteInstances true &
+    cloud_DeleteInstances $forceDelete
   fi
 
   wait
@@ -518,17 +651,29 @@ delete() {
   $metricsWriteDatapoint "testnet-deploy net-delete-complete=1"
 }
 
+create_error_cleanup() {
+  declare RC=$?
+  if [[ "$RC" -ne 0 ]]; then
+    delete
+  fi
+  exit $RC
+}
+
 case $command in
 delete)
   delete
   ;;
 
 create)
-  [[ -n $additionalFullNodeCount ]] || usage "Need number of nodes"
+  [[ -n $additionalValidatorCount ]] || usage "Need number of nodes"
 
   delete
 
   $metricsWriteDatapoint "testnet-deploy net-create-begin=1"
+
+  if $failOnValidatorBootupFailure; then
+    trap create_error_cleanup EXIT
+  fi
 
   rm -rf "$sshPrivateKey"{,.pub}
 
@@ -538,10 +683,9 @@ create)
   printNetworkInfo() {
     cat <<EOF
 ==[ Network composition ]===============================================================
-  Bootstrap leader = $bootstrapLeaderMachineType (GPU=$enableGpu)
-  Additional fullnodes = $additionalFullNodeCount x $fullNodeMachineType
+  Bootstrap validator = $bootstrapLeaderMachineType (GPU=$enableGpu)
+  Additional validators = $additionalValidatorCount x $validatorMachineType
   Client(s) = $clientNodeCount x $clientMachineType
-  Replicators(s) = $replicatorNodeCount x $replicatorMachineType
   Blockstreamer = $blockstreamer
 ========================================================================================
 
@@ -565,6 +709,28 @@ EOF
 # autogenerated at $(date)
 set -ex
 
+if [[ -f /solana-scratch/.instance-startup-complete ]]; then
+  echo reboot
+  $(
+    cd "$here"/scripts/
+    if "$enableGpu"; then
+      cat enable-nvidia-persistence-mode.sh
+    fi
+
+    if [[ -n $validatorAdditionalDiskSizeInGb ]]; then
+      cat mount-additional-disk.sh
+    fi
+
+    cat ../../scripts/ulimit-n.sh
+  )
+  if [[ -x ~solana/solana/on-reboot ]]; then
+    sudo -u solana ~solana/solana/on-reboot
+  fi
+
+  # Skip most setup on instance reboot
+  exit 0
+fi
+
 cat > /etc/motd <<EOM
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -574,21 +740,22 @@ cat > /etc/motd <<EOM
     $ sudo cat /var/log/syslog | egrep \\(startup-script\\|cloud-init\)
 
   To block until setup is complete, run:
-    $ until [[ -f /.instance-startup-complete ]]; do sleep 1; done
+    $ until [[ -f /solana-scratch/.instance-startup-complete ]]; do sleep 1; done
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 $(creationInfo)
 EOM
 
-# Place the generated private key at /solana-id_ecdsa so it's retrievable by anybody
+# Place the generated private key at /solana-scratch/id_ecdsa so it's retrievable by anybody
 # who is able to log into this machine
-cat > /solana-id_ecdsa <<EOK
+mkdir -m 0777 /solana-scratch
+cat > /solana-scratch/id_ecdsa <<EOK
 $(cat "$sshPrivateKey")
 EOK
-cat > /solana-id_ecdsa.pub <<EOK
+cat > /solana-scratch/id_ecdsa.pub <<EOK
 $(cat "$sshPrivateKey.pub")
 EOK
-chmod 444 /solana-id_ecdsa
+chmod 444 /solana-scratch/id_ecdsa
 
 USER=\$(id -un)
 export DEBIAN_FRONTEND=noninteractive
@@ -597,8 +764,12 @@ $(
   cat \
     disable-background-upgrades.sh \
     create-solana-user.sh \
-    add-solana-user-authorized_keys.sh \
+    solana-user-authorized_keys.sh \
+    add-testnet-solana-user-authorized_keys.sh \
+    install-ag.sh \
+    install-certbot.sh \
     install-earlyoom.sh \
+    install-iftop.sh \
     install-libssl-compatability.sh \
     install-nodejs.sh \
     install-redis.sh \
@@ -607,18 +778,59 @@ $(
     network-config.sh \
     remove-docker-interface.sh \
 
-    if "$enableGpu"; then
-      cat enable-nvidia-persistence-mode.sh
-    fi
+  if "$enableGpu"; then
+    cat enable-nvidia-persistence-mode.sh
+  fi
 
+  if [[ -n $validatorAdditionalDiskSizeInGb ]]; then
+    cat mount-additional-disk.sh
+  fi
+
+  if [[ $selfDestructHours -gt 0 ]]; then
+    cat <<EOSD
+
+# Setup GCE self-destruct
+cat >/solana-scratch/gce-self-destruct.sh <<'EOS'
+$(cat gce-self-destruct.sh)
+EOS
+EOSD
+    cat <<'EOSD'
+
+# Populate terminal prompt update script
+cat >/solana-scratch/gce-self-destruct-ps1.sh <<'EOS'
+#!/usr/bin/env bash
+source "$(dirname "$0")/gce-self-destruct.sh"
+gce_self_destruct_ps1
+EOS
+chmod +x /solana-scratch/gce-self-destruct-ps1.sh
+
+# Append MOTD and PS1 replacement to .profile
+cat >>~solana/.profile <<'EOS'
+
+# Print self-destruct countdown on login
+source "/solana-scratch/gce-self-destruct.sh"
+gce_self_destruct_motd
+
+# Add self-destruct countdown to terminal prompt
+export PS1='\[\e]0;\u@\h: \w\a\]${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u@\h\[\033[00m\]$(/solana-scratch/gce-self-destruct-ps1.sh):\[\033[01;34m\]\w\[\033[00m\]\$ '
+EOS
+EOSD
+    cat <<EOSD
+
+source /solana-scratch/gce-self-destruct.sh
+gce_self_destruct_setup $selfDestructHours
+EOSD
+  fi
 )
 
 cat > /etc/motd <<EOM
+See startup script log messages in /var/log/syslog for status:
+  $ sudo cat /var/log/syslog | egrep \\(startup-script\\|cloud-init\)
 $(printNetworkInfo)
 $(creationInfo)
 EOM
 
-touch /.instance-startup-complete
+touch /solana-scratch/.instance-startup-complete
 
 EOF
 
@@ -633,18 +845,19 @@ EOF
   done
 
   if $externalNodes; then
-    echo "Bootstrap leader is already configured"
+    echo "Bootstrap validator is already configured"
   else
-    cloud_CreateInstances "$prefix" "$prefix-bootstrap-leader" 1 \
-      "$enableGpu" "$bootstrapLeaderMachineType" "${zones[0]}" "$fullNodeBootDiskSizeInGb" \
-      "$startupScript" "$bootstrapLeaderAddress" "$bootDiskType"
+    cloud_CreateInstances "$prefix" "$prefix-bootstrap-validator" 1 \
+      "$enableGpu" "$bootstrapLeaderMachineType" "${zones[0]}" "$validatorBootDiskSizeInGb" \
+      "$startupScript" "$bootstrapLeaderAddress" "$bootDiskType" "$validatorAdditionalDiskSizeInGb" \
+      "$maybePreemptible" "$sshPrivateKey"
   fi
 
-  if [[ $additionalFullNodeCount -gt 0 ]]; then
+  if [[ $additionalValidatorCount -gt 0 ]]; then
     num_zones=${#zones[@]}
-    if [[ $additionalFullNodeCount -gt $num_zones ]]; then
-      numNodesPerZone=$((additionalFullNodeCount / num_zones))
-      numLeftOverNodes=$((additionalFullNodeCount % num_zones))
+    if [[ $additionalValidatorCount -gt $num_zones ]]; then
+      numNodesPerZone=$((additionalValidatorCount / num_zones))
+      numLeftOverNodes=$((additionalValidatorCount % num_zones))
     else
       numNodesPerZone=1
       numLeftOverNodes=0
@@ -655,9 +868,10 @@ EOF
       if [[ $i -eq 0 ]]; then
         numNodesPerZone=$((numNodesPerZone + numLeftOverNodes))
       fi
-      cloud_CreateInstances "$prefix" "$prefix-$zone-fullnode" "$numNodesPerZone" \
-        "$enableGpu" "$fullNodeMachineType" "$zone" "$fullNodeBootDiskSizeInGb" \
-        "$startupScript" "" "$bootDiskType" &
+      cloud_CreateInstances "$prefix" "$prefix-$zone-validator" "$numNodesPerZone" \
+        "$enableGpu" "$validatorMachineType" "$zone" "$validatorBootDiskSizeInGb" \
+        "$startupScript" "" "$bootDiskType" "$validatorAdditionalDiskSizeInGb" \
+        "$preemptible" "$sshPrivateKey" &
     done
 
     wait
@@ -666,19 +880,13 @@ EOF
   if [[ $clientNodeCount -gt 0 ]]; then
     cloud_CreateInstances "$prefix" "$prefix-client" "$clientNodeCount" \
       "$enableGpu" "$clientMachineType" "${zones[0]}" "$clientBootDiskSizeInGb" \
-      "$startupScript" "" "$bootDiskType"
+      "$startupScript" "" "$bootDiskType" "" "$maybePreemptible" "$sshPrivateKey"
   fi
 
   if $blockstreamer; then
     cloud_CreateInstances "$prefix" "$prefix-blockstreamer" "1" \
-      "$enableGpu" "$blockstreamerMachineType" "${zones[0]}" "$fullNodeBootDiskSizeInGb" \
-      "$startupScript" "$blockstreamerAddress" "$bootDiskType"
-  fi
-
-  if [[ $replicatorNodeCount -gt 0 ]]; then
-    cloud_CreateInstances "$prefix" "$prefix-replicator" "$replicatorNodeCount" \
-      false "$replicatorMachineType" "${zones[0]}" "$replicatorBootDiskSizeInGb" \
-      "$startupScript" "" ""
+      "$enableGpu" "$blockstreamerMachineType" "${zones[0]}" "$validatorBootDiskSizeInGb" \
+      "$startupScript" "$blockstreamerAddress" "$bootDiskType" "" "$maybePreemptible" "$sshPrivateKey"
   fi
 
   $metricsWriteDatapoint "testnet-deploy net-create-complete=1"
@@ -687,6 +895,7 @@ EOF
   ;;
 
 config)
+  failOnValidatorBootupFailure=false
   prepareInstancesAndWriteConfigFile
   ;;
 info)
@@ -699,37 +908,59 @@ info)
     printf "  %-16s | %-15s | %-15s | %s\n" "$nodeType" "$ip" "$ipPrivate" "$zone"
   }
 
-  printNode "Node Type" "Public IP" "Private IP" "Zone"
-  echo "-------------------+-----------------+-----------------+--------------"
-  nodeType=bootstrap-leader
-  for i in $(seq 0 $(( ${#fullnodeIpList[@]} - 1)) ); do
-    ipAddress=${fullnodeIpList[$i]}
-    ipAddressPrivate=${fullnodeIpListPrivate[$i]}
-    zone=${fullnodeIpListZone[$i]}
-    printNode $nodeType "$ipAddress" "$ipAddressPrivate" "$zone"
-    nodeType=fullnode
-  done
+  if $evalInfo; then
+    echo "NET_NUM_VALIDATORS=${#validatorIpList[@]}"
+    echo "NET_NUM_CLIENTS=${#clientIpList[@]}"
+    echo "NET_NUM_BLOCKSTREAMERS=${#blockstreamerIpList[@]}"
+  else
+    printNode "Node Type" "Public IP" "Private IP" "Zone"
+    echo "-------------------+-----------------+-----------------+--------------"
+  fi
 
-  for i in $(seq 0 $(( ${#clientIpList[@]} - 1)) ); do
-    ipAddress=${clientIpList[$i]}
-    ipAddressPrivate=${clientIpListPrivate[$i]}
-    zone=${clientIpListZone[$i]}
-    printNode client "$ipAddress" "$ipAddressPrivate" "$zone"
-  done
+  nodeType=bootstrap-validator
+  if [[ ${#validatorIpList[@]} -gt 0 ]]; then
+    for i in $(seq 0 $(( ${#validatorIpList[@]} - 1)) ); do
+      ipAddress=${validatorIpList[$i]}
+      ipAddressPrivate=${validatorIpListPrivate[$i]}
+      zone=${validatorIpListZone[$i]}
+      if $evalInfo; then
+        echo "NET_VALIDATOR${i}_IP=$ipAddress"
+      else
+        printNode $nodeType "$ipAddress" "$ipAddressPrivate" "$zone"
+      fi
+      nodeType=validator
+    done
+  fi
 
-  for i in $(seq 0 $(( ${#blockstreamerIpList[@]} - 1)) ); do
-    ipAddress=${blockstreamerIpList[$i]}
-    ipAddressPrivate=${blockstreamerIpListPrivate[$i]}
-    zone=${blockstreamerIpListZone[$i]}
-    printNode blockstreamer "$ipAddress" "$ipAddressPrivate" "$zone"
-  done
+  if [[ ${#clientIpList[@]} -gt 0 ]]; then
+    for i in $(seq 0 $(( ${#clientIpList[@]} - 1)) ); do
+      ipAddress=${clientIpList[$i]}
+      ipAddressPrivate=${clientIpListPrivate[$i]}
+      zone=${clientIpListZone[$i]}
+      if $evalInfo; then
+        echo "NET_CLIENT${i}_IP=$ipAddress"
+      else
+        printNode client "$ipAddress" "$ipAddressPrivate" "$zone"
+      fi
+    done
+  fi
 
-  for i in $(seq 0 $(( ${#replicatorIpList[@]} - 1)) ); do
-    ipAddress=${replicatorIpList[$i]}
-    ipAddressPrivate=${replicatorIpListPrivate[$i]}
-    zone=${replicatorIpListZone[$i]}
-    printNode replicator "$ipAddress" "$ipAddressPrivate" "$zone"
-  done
+  if [[ ${#blockstreamerIpList[@]} -gt 0 ]]; then
+    for i in $(seq 0 $(( ${#blockstreamerIpList[@]} - 1)) ); do
+      ipAddress=${blockstreamerIpList[$i]}
+      ipAddressPrivate=${blockstreamerIpListPrivate[$i]}
+      zone=${blockstreamerIpListZone[$i]}
+      if $evalInfo; then
+        echo "NET_BLOCKSTREAMER${i}_IP=$ipAddress"
+      else
+        printNode blockstreamer "$ipAddress" "$ipAddressPrivate" "$zone"
+      fi
+    done
+  fi
+
+  ;;
+status)
+  cloud_StatusAll
   ;;
 *)
   usage "Unknown command: $command"

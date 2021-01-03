@@ -1,21 +1,33 @@
 //! The `tpu` module implements the Transaction Processing Unit, a
 //! multi-stage transaction processing pipeline in software.
 
-use crate::banking_stage::BankingStage;
-use crate::blocktree::Blocktree;
-use crate::broadcast_stage::{BroadcastStage, BroadcastStageType};
-use crate::cluster_info::ClusterInfo;
-use crate::cluster_info_vote_listener::ClusterInfoVoteListener;
-use crate::fetch_stage::FetchStage;
-use crate::poh_recorder::{PohRecorder, WorkingBankEntries};
-use crate::service::Service;
-use crate::sigverify_stage::SigVerifyStage;
-use solana_sdk::pubkey::Pubkey;
-use std::net::UdpSocket;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+use crate::{
+    banking_stage::BankingStage,
+    broadcast_stage::{BroadcastStage, BroadcastStageType, RetransmitSlotsReceiver},
+    cluster_info::ClusterInfo,
+    cluster_info_vote_listener::{ClusterInfoVoteListener, VerifiedVoteSender, VoteTracker},
+    fetch_stage::FetchStage,
+    optimistically_confirmed_bank_tracker::BankNotificationSender,
+    poh_recorder::{PohRecorder, WorkingBankEntry},
+    rpc_subscriptions::RpcSubscriptions,
+    sigverify::TransactionSigVerifier,
+    sigverify_stage::SigVerifyStage,
+};
+use crossbeam_channel::unbounded;
+use solana_ledger::{blockstore::Blockstore, blockstore_processor::TransactionStatusSender};
+use solana_runtime::{
+    bank_forks::BankForks,
+    vote_sender_types::{ReplayVoteReceiver, ReplayVoteSender},
+};
+use std::{
+    net::UdpSocket,
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{channel, Receiver},
+        Arc, Mutex, RwLock,
+    },
+    thread,
+};
 
 pub struct Tpu {
     fetch_stage: FetchStage,
@@ -28,55 +40,73 @@ pub struct Tpu {
 impl Tpu {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        id: &Pubkey,
-        cluster_info: &Arc<RwLock<ClusterInfo>>,
+        cluster_info: &Arc<ClusterInfo>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
-        entry_receiver: Receiver<WorkingBankEntries>,
+        entry_receiver: Receiver<WorkingBankEntry>,
+        retransmit_slots_receiver: RetransmitSlotsReceiver,
         transactions_sockets: Vec<UdpSocket>,
-        tpu_via_blobs_sockets: Vec<UdpSocket>,
-        broadcast_socket: UdpSocket,
-        sigverify_disabled: bool,
-        blocktree: &Arc<Blocktree>,
+        tpu_forwards_sockets: Vec<UdpSocket>,
+        broadcast_sockets: Vec<UdpSocket>,
+        subscriptions: &Arc<RpcSubscriptions>,
+        transaction_status_sender: Option<TransactionStatusSender>,
+        blockstore: &Arc<Blockstore>,
         broadcast_type: &BroadcastStageType,
         exit: &Arc<AtomicBool>,
+        shred_version: u16,
+        vote_tracker: Arc<VoteTracker>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        verified_vote_sender: VerifiedVoteSender,
+        replay_vote_receiver: ReplayVoteReceiver,
+        replay_vote_sender: ReplayVoteSender,
+        bank_notification_sender: Option<BankNotificationSender>,
     ) -> Self {
-        cluster_info.write().unwrap().set_leader(id);
-
         let (packet_sender, packet_receiver) = channel();
         let fetch_stage = FetchStage::new_with_sender(
             transactions_sockets,
-            tpu_via_blobs_sockets,
+            tpu_forwards_sockets,
             &exit,
             &packet_sender,
             &poh_recorder,
         );
-        let (verified_sender, verified_receiver) = channel();
+        let (verified_sender, verified_receiver) = unbounded();
 
-        let sigverify_stage =
-            SigVerifyStage::new(packet_receiver, sigverify_disabled, verified_sender.clone());
+        let sigverify_stage = {
+            let verifier = TransactionSigVerifier::default();
+            SigVerifyStage::new(packet_receiver, verified_sender, verifier)
+        };
 
-        let (verified_vote_sender, verified_vote_receiver) = channel();
+        let (verified_vote_packets_sender, verified_vote_packets_receiver) = unbounded();
         let cluster_info_vote_listener = ClusterInfoVoteListener::new(
             &exit,
             cluster_info.clone(),
-            sigverify_disabled,
-            verified_vote_sender,
+            verified_vote_packets_sender,
             &poh_recorder,
+            vote_tracker,
+            bank_forks,
+            subscriptions.clone(),
+            verified_vote_sender,
+            replay_vote_receiver,
+            blockstore.clone(),
+            bank_notification_sender,
         );
 
         let banking_stage = BankingStage::new(
             &cluster_info,
             poh_recorder,
             verified_receiver,
-            verified_vote_receiver,
+            verified_vote_packets_receiver,
+            transaction_status_sender,
+            replay_vote_sender,
         );
 
         let broadcast_stage = broadcast_type.new_broadcast_stage(
-            broadcast_socket,
+            broadcast_sockets,
             cluster_info.clone(),
             entry_receiver,
+            retransmit_slots_receiver,
             &exit,
-            blocktree,
+            blockstore,
+            shred_version,
         );
 
         Self {
@@ -87,12 +117,8 @@ impl Tpu {
             broadcast_stage,
         }
     }
-}
 
-impl Service for Tpu {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         let mut results = vec![];
         results.push(self.fetch_stage.join());
         results.push(self.sigverify_stage.join());

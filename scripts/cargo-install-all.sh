@@ -2,64 +2,146 @@
 #
 # |cargo install| of the top-level crate will not install binaries for
 # other workspace crates or native program crates.
+here="$(dirname "$0")"
+cargo="$(readlink -f "${here}/../cargo")"
+
 set -e
 
-export rust_version=
-if [[ $1 =~ \+ ]]; then
-  export rust_version=$1
-  shift
-fi
+usage() {
+  exitcode=0
+  if [[ -n "$1" ]]; then
+    exitcode=1
+    echo "Error: $*"
+  fi
+  cat <<EOF
+usage: $0 [+<cargo version>] [--debug] <install directory>
+EOF
+  exit $exitcode
+}
 
-if [[ -z $1 ]]; then
-  echo Install directory not specified
+maybeRustVersion=
+installDir=
+buildVariant=release
+maybeReleaseFlag=--release
+
+while [[ -n $1 ]]; do
+  if [[ ${1:0:1} = - ]]; then
+    if [[ $1 = --debug ]]; then
+      maybeReleaseFlag=
+      buildVariant=debug
+      shift
+    else
+      usage "Unknown option: $1"
+    fi
+  elif [[ ${1:0:1} = \+ ]]; then
+    maybeRustVersion=$1
+    shift
+  else
+    installDir=$1
+    shift
+  fi
+done
+
+if [[ -z "$installDir" ]]; then
+  usage "Install directory not specified"
   exit 1
 fi
 
-installDir="$(mkdir -p "$1"; cd "$1"; pwd)"
-cargoFeatures="$2"
-echo "Install location: $installDir"
+installDir="$(mkdir -p "$installDir"; cd "$installDir"; pwd)"
+mkdir -p "$installDir/bin/deps"
+
+echo "Install location: $installDir ($buildVariant)"
 
 cd "$(dirname "$0")"/..
 
 SECONDS=0
 
-(
-  set -x
-  # shellcheck disable=SC2086 # Don't want to double quote $rust_version
-  cargo $rust_version build --all --release --features="$cargoFeatures"
-)
-
-BIN_CRATES=(
-  drone
-  genesis
-  gossip
-  install
-  keygen
-  ledger-tool
-  replicator
-  validator
-  wallet
-  bench-exchange
-  bench-tps
-)
-
-for crate in "${BIN_CRATES[@]}"; do
+if [[ $CI_OS_NAME = windows ]]; then
+  # Limit windows to end-user command-line tools.  Full validator support is not
+  # yet available on windows
+  BINS=(
+    solana
+    solana-install
+    solana-install-init
+    solana-keygen
+    solana-stake-accounts
+    solana-tokens
+  )
+else
+  ./fetch-perf-libs.sh
   (
     set -x
     # shellcheck disable=SC2086 # Don't want to double quote $rust_version
-    cargo $rust_version install --force --path "$crate" --root "$installDir" --features="$cargoFeatures"
+    $cargo $maybeRustVersion build $maybeReleaseFlag
   )
+
+
+  BINS=(
+    cargo-build-bpf
+    cargo-test-bpf
+    solana
+    solana-bench-exchange
+    solana-bench-tps
+    solana-dos
+    solana-faucet
+    solana-gossip
+    solana-install
+    solana-install-init
+    solana-keygen
+    solana-ledger-tool
+    solana-log-analyzer
+    solana-net-shaper
+    solana-stake-accounts
+    solana-stake-monitor
+    solana-stake-o-matic
+    solana-sys-tuner
+    solana-test-validator
+    solana-tokens
+    solana-validator
+    solana-watchtower
+  )
+
+  #XXX: Ensure `solana-genesis` is built LAST!
+  # See https://github.com/solana-labs/solana/issues/5826
+  BINS+=(solana-genesis)
+fi
+
+binArgs=()
+for bin in "${BINS[@]}"; do
+  binArgs+=(--bin "$bin")
 done
 
-for dir in programs/*; do
-  for program in echo target/release/deps/libsolana_"$(basename "$dir")".{so,dylib,dll}; do
-    if [[ -f $program ]]; then
-      mkdir -p "$installDir/bin/deps"
-      rm -f "$installDir/bin/deps/$(basename "$program")"
-      cp -v "$program" "$installDir"/bin/deps
-    fi
+mkdir -p "$installDir/bin"
+
+(
+  set -x
+  # shellcheck disable=SC2086 # Don't want to double quote $rust_version
+  "$cargo" $maybeRustVersion build $maybeReleaseFlag "${binArgs[@]}"
+  # shellcheck disable=SC2086 # Don't want to double quote $rust_version
+  "$cargo" $maybeRustVersion install spl-token-cli --root "$installDir"
+)
+
+for bin in "${BINS[@]}"; do
+  cp -fv "target/$buildVariant/$bin" "$installDir"/bin
+done
+
+if [[ -d target/perf-libs ]]; then
+  cp -a target/perf-libs "$installDir"/bin/perf-libs
+fi
+
+mkdir -p "$installDir"/bin/sdk/bpf
+cp -a sdk/bpf/* "$installDir"/bin/sdk/bpf
+
+(
+  set -x
+  # deps dir can be empty
+  shopt -s nullglob
+  for dep in target/"$buildVariant"/deps/libsolana*program.*; do
+    cp -fv "$dep" "$installDir/bin/deps"
   done
-done
+)
 
-du -a "$installDir"
 echo "Done after $SECONDS seconds"
+echo
+echo "To use these binaries:"
+echo "  export PATH=\"$installDir\"/bin:\"\$PATH\""

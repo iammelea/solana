@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
-use solana_sdk::fee_calculator::FeeCalculator;
-use solana_sdk::hash::Hash;
-use solana_sdk::timing::timestamp;
+use solana_sdk::{
+    fee_calculator::FeeCalculator, hash::Hash, sysvar::recent_blockhashes, timing::timestamp,
+};
 use std::collections::HashMap;
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, AbiExample)]
 struct HashAge {
     fee_calculator: FeeCalculator,
     hash_height: u64,
@@ -12,7 +12,8 @@ struct HashAge {
 }
 
 /// Low memory overhead, so can be cloned for every checkpoint
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[frozen_abi(digest = "J1fGiMHyiKEBcWE6mfm7grAEGJgYEaVLzcrNZvd37iA2")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, AbiExample)]
 pub struct BlockhashQueue {
     /// updated whenever an hash is registered
     hash_height: u64,
@@ -51,12 +52,17 @@ impl BlockhashQueue {
 
     /// Check if the age of the hash is within the max_age
     /// return false for any hashes with an age above max_age
-    pub fn check_hash_age(&self, hash: &Hash, max_age: usize) -> bool {
-        let hash_age = self.ages.get(hash);
-        match hash_age {
-            Some(age) => self.hash_height - age.hash_height <= max_age as u64,
-            _ => false,
-        }
+    /// return None for any hashes that were not found
+    pub fn check_hash_age(&self, hash: &Hash, max_age: usize) -> Option<bool> {
+        self.ages
+            .get(hash)
+            .map(|age| self.hash_height - age.hash_height <= max_age as u64)
+    }
+
+    pub fn get_hash_age(&self, hash: &Hash) -> Option<u64> {
+        self.ages
+            .get(hash)
+            .map(|age| self.hash_height - age.hash_height)
     }
 
     /// check if hash is valid
@@ -114,12 +120,24 @@ impl BlockhashQueue {
         }
         None
     }
+
+    pub fn get_recent_blockhashes(&self) -> impl Iterator<Item = recent_blockhashes::IterItem> {
+        (&self.ages)
+            .iter()
+            .map(|(k, v)| recent_blockhashes::IterItem(v.hash_height, k, &v.fee_calculator))
+    }
+
+    pub fn len(&self) -> usize {
+        self.max_age
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use bincode::serialize;
-    use solana_sdk::hash::hash;
+    use solana_sdk::{
+        clock::MAX_RECENT_BLOCKHASHES, hash::hash, sysvar::recent_blockhashes::IterItem,
+    };
 
     #[test]
     fn test_register_hash() {
@@ -130,6 +148,7 @@ mod tests {
         assert!(hash_queue.check_hash(last_hash));
         assert_eq!(hash_queue.hash_height(), 1);
     }
+
     #[test]
     fn test_reject_old_last_hash() {
         let mut hash_queue = BlockhashQueue::new(100);
@@ -140,7 +159,14 @@ mod tests {
         }
         // Assert we're no longer able to use the oldest hash.
         assert!(!hash_queue.check_hash(last_hash));
+        assert_eq!(None, hash_queue.check_hash_age(&last_hash, 0));
+
+        // Assert we are not able to use the oldest remaining hash.
+        let last_valid_hash = hash(&serialize(&1).unwrap());
+        assert!(hash_queue.check_hash(last_valid_hash));
+        assert_eq!(Some(false), hash_queue.check_hash_age(&last_valid_hash, 0));
     }
+
     /// test that when max age is 0, that a valid last_hash still passes the age check
     #[test]
     fn test_queue_init_blockhash() {
@@ -148,6 +174,26 @@ mod tests {
         let mut hash_queue = BlockhashQueue::new(100);
         hash_queue.register_hash(&last_hash, &FeeCalculator::default());
         assert_eq!(last_hash, hash_queue.last_hash());
-        assert!(hash_queue.check_hash_age(&last_hash, 0));
+        assert_eq!(Some(true), hash_queue.check_hash_age(&last_hash, 0));
+    }
+
+    #[test]
+    fn test_get_recent_blockhashes() {
+        let mut blockhash_queue = BlockhashQueue::new(MAX_RECENT_BLOCKHASHES);
+        let recent_blockhashes = blockhash_queue.get_recent_blockhashes();
+        // Sanity-check an empty BlockhashQueue
+        assert_eq!(recent_blockhashes.count(), 0);
+        for i in 0..MAX_RECENT_BLOCKHASHES {
+            let hash = hash(&serialize(&i).unwrap());
+            blockhash_queue.register_hash(&hash, &FeeCalculator::default());
+        }
+        let recent_blockhashes = blockhash_queue.get_recent_blockhashes();
+        // Verify that the returned hashes are most recent
+        for IterItem(_slot, hash, _fee_calc) in recent_blockhashes {
+            assert_eq!(
+                Some(true),
+                blockhash_queue.check_hash_age(hash, MAX_RECENT_BLOCKHASHES)
+            );
+        }
     }
 }

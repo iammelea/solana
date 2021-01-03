@@ -1,156 +1,174 @@
-use crate::entry::Entry;
-use crate::entry::EntrySlice;
-use crate::erasure::CodingGenerator;
-use crate::packet::{self, SharedBlob};
-use crate::poh_recorder::WorkingBankEntries;
+use crate::poh_recorder::WorkingBankEntry;
 use crate::result::Result;
-use rayon::prelude::*;
-use rayon::ThreadPool;
+use solana_ledger::entry::Entry;
 use solana_runtime::bank::Bank;
-use solana_sdk::signature::{Keypair, KeypairUtil, Signable};
-use std::sync::mpsc::Receiver;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use solana_sdk::clock::Slot;
+use std::{
+    sync::mpsc::Receiver,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub(super) struct ReceiveResults {
-    pub ventries: Vec<Vec<(Entry, u64)>>,
-    pub num_entries: usize,
+    pub entries: Vec<Entry>,
     pub time_elapsed: Duration,
     pub bank: Arc<Bank>,
-    pub last_tick: u64,
+    pub last_tick_height: u64,
 }
 
-impl ReceiveResults {
-    pub fn new(
-        ventries: Vec<Vec<(Entry, u64)>>,
-        num_entries: usize,
-        time_elapsed: Duration,
-        bank: Arc<Bank>,
-        last_tick: u64,
-    ) -> Self {
-        Self {
-            ventries,
-            num_entries,
-            time_elapsed,
-            bank,
-            last_tick,
-        }
-    }
+#[derive(Copy, Clone)]
+pub struct UnfinishedSlotInfo {
+    pub next_shred_index: u32,
+    pub slot: Slot,
+    pub parent: Slot,
 }
 
-pub(super) fn recv_slot_blobs(receiver: &Receiver<WorkingBankEntries>) -> Result<ReceiveResults> {
+/// This parameter tunes how many entries are received in one iteration of recv loop
+/// This will prevent broadcast stage from consuming more entries, that could have led
+/// to delays in shredding, and broadcasting shreds to peer validators
+const RECEIVE_ENTRY_COUNT_THRESHOLD: usize = 8;
+
+pub(super) fn recv_slot_entries(receiver: &Receiver<WorkingBankEntry>) -> Result<ReceiveResults> {
     let timer = Duration::new(1, 0);
-    let (mut bank, entries) = receiver.recv_timeout(timer)?;
     let recv_start = Instant::now();
-    let mut max_tick_height = bank.max_tick_height();
-    let mut num_entries = entries.len();
-    let mut ventries = Vec::new();
-    let mut last_tick = entries.last().map(|v| v.1).unwrap_or(0);
-    ventries.push(entries);
+    let (mut bank, (entry, mut last_tick_height)) = receiver.recv_timeout(timer)?;
 
-    assert!(last_tick <= max_tick_height);
-    if last_tick != max_tick_height {
-        while let Ok((same_bank, entries)) = receiver.try_recv() {
+    let mut entries = vec![entry];
+    let mut slot = bank.slot();
+    let mut max_tick_height = bank.max_tick_height();
+
+    assert!(last_tick_height <= max_tick_height);
+
+    if last_tick_height != max_tick_height {
+        while let Ok((try_bank, (entry, tick_height))) = receiver.try_recv() {
             // If the bank changed, that implies the previous slot was interrupted and we do not have to
             // broadcast its entries.
-            if same_bank.slot() != bank.slot() {
-                num_entries = 0;
-                ventries.clear();
-                bank = same_bank.clone();
+            if try_bank.slot() != slot {
+                warn!("Broadcast for slot: {} interrupted", bank.slot());
+                entries.clear();
+                bank = try_bank;
+                slot = bank.slot();
                 max_tick_height = bank.max_tick_height();
             }
-            num_entries += entries.len();
-            last_tick = entries.last().map(|v| v.1).unwrap_or(0);
-            ventries.push(entries);
-            assert!(last_tick <= max_tick_height,);
-            if last_tick == max_tick_height {
+            last_tick_height = tick_height;
+            entries.push(entry);
+
+            if entries.len() >= RECEIVE_ENTRY_COUNT_THRESHOLD {
+                break;
+            }
+
+            assert!(last_tick_height <= max_tick_height);
+            if last_tick_height == max_tick_height {
                 break;
             }
         }
     }
 
-    let recv_end = recv_start.elapsed();
-    let receive_results = ReceiveResults::new(ventries, num_entries, recv_end, bank, last_tick);
-    Ok(receive_results)
+    let time_elapsed = recv_start.elapsed();
+    Ok(ReceiveResults {
+        entries,
+        time_elapsed,
+        bank,
+        last_tick_height,
+    })
 }
 
-pub(super) fn entries_to_blobs(
-    ventries: Vec<Vec<(Entry, u64)>>,
-    thread_pool: &ThreadPool,
-    latest_blob_index: u64,
-    last_tick: u64,
-    bank: &Bank,
-    keypair: &Keypair,
-    coding_generator: &mut CodingGenerator,
-) -> (Vec<SharedBlob>, Vec<SharedBlob>) {
-    let blobs = generate_data_blobs(
-        ventries,
-        thread_pool,
-        latest_blob_index,
-        last_tick,
-        &bank,
-        &keypair,
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo};
+    use solana_sdk::genesis_config::GenesisConfig;
+    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::system_transaction;
+    use solana_sdk::transaction::Transaction;
+    use std::sync::mpsc::channel;
 
-    let coding = generate_coding_blobs(&blobs, &thread_pool, coding_generator, &keypair);
+    fn setup_test() -> (GenesisConfig, Arc<Bank>, Transaction) {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(2);
+        let bank0 = Arc::new(Bank::new(&genesis_config));
+        let tx = system_transaction::transfer(
+            &mint_keypair,
+            &solana_sdk::pubkey::new_rand(),
+            1,
+            genesis_config.hash(),
+        );
 
-    (blobs, coding)
-}
-
-pub(super) fn generate_data_blobs(
-    ventries: Vec<Vec<(Entry, u64)>>,
-    thread_pool: &ThreadPool,
-    latest_blob_index: u64,
-    last_tick: u64,
-    bank: &Bank,
-    keypair: &Keypair,
-) -> Vec<SharedBlob> {
-    let blobs: Vec<SharedBlob> = thread_pool.install(|| {
-        ventries
-            .into_par_iter()
-            .map(|p| {
-                let entries: Vec<_> = p.into_iter().map(|e| e.0).collect();
-                entries.to_shared_blobs()
-            })
-            .flatten()
-            .collect()
-    });
-
-    packet::index_blobs(
-        &blobs,
-        &keypair.pubkey(),
-        latest_blob_index,
-        bank.slot(),
-        bank.parent().map_or(0, |parent| parent.slot()),
-    );
-
-    if last_tick == bank.max_tick_height() {
-        blobs.last().unwrap().write().unwrap().set_is_last_in_slot();
+        (genesis_config, bank0, tx)
     }
 
-    // Make sure not to modify the blob header or data after signing it here
-    thread_pool.install(|| {
-        blobs.par_iter().for_each(|b| {
-            b.write().unwrap().sign(keypair);
-        })
-    });
+    #[test]
+    fn test_recv_slot_entries_1() {
+        let (genesis_config, bank0, tx) = setup_test();
 
-    blobs
-}
+        let bank1 = Arc::new(Bank::new_from_parent(&bank0, &Pubkey::default(), 1));
+        let (s, r) = channel();
+        let mut last_hash = genesis_config.hash();
 
-pub(super) fn generate_coding_blobs(
-    blobs: &[SharedBlob],
-    thread_pool: &ThreadPool,
-    coding_generator: &mut CodingGenerator,
-    keypair: &Keypair,
-) -> Vec<SharedBlob> {
-    let coding = coding_generator.next(&blobs);
+        assert!(bank1.max_tick_height() > 1);
+        let entries: Vec<_> = (1..bank1.max_tick_height() + 1)
+            .map(|i| {
+                let entry = Entry::new(&last_hash, 1, vec![tx.clone()]);
+                last_hash = entry.hash;
+                s.send((bank1.clone(), (entry.clone(), i))).unwrap();
+                entry
+            })
+            .collect();
 
-    thread_pool.install(|| {
-        coding.par_iter().for_each(|c| {
-            c.write().unwrap().sign(keypair);
-        })
-    });
+        let mut res_entries = vec![];
+        let mut last_tick_height = 0;
+        while let Ok(result) = recv_slot_entries(&r) {
+            assert_eq!(result.bank.slot(), bank1.slot());
+            last_tick_height = result.last_tick_height;
+            res_entries.extend(result.entries);
+        }
+        assert_eq!(last_tick_height, bank1.max_tick_height());
+        assert_eq!(res_entries, entries);
+    }
 
-    coding
+    #[test]
+    fn test_recv_slot_entries_2() {
+        let (genesis_config, bank0, tx) = setup_test();
+
+        let bank1 = Arc::new(Bank::new_from_parent(&bank0, &Pubkey::default(), 1));
+        let bank2 = Arc::new(Bank::new_from_parent(&bank1, &Pubkey::default(), 2));
+        let (s, r) = channel();
+
+        let mut last_hash = genesis_config.hash();
+        assert!(bank1.max_tick_height() > 1);
+        // Simulate slot 2 interrupting slot 1's transmission
+        let expected_last_height = bank1.max_tick_height();
+        let last_entry = (1..=bank1.max_tick_height())
+            .map(|tick_height| {
+                let entry = Entry::new(&last_hash, 1, vec![tx.clone()]);
+                last_hash = entry.hash;
+                // Interrupt slot 1 right before the last tick
+                if tick_height == expected_last_height {
+                    s.send((bank2.clone(), (entry.clone(), tick_height)))
+                        .unwrap();
+                    Some(entry)
+                } else {
+                    s.send((bank1.clone(), (entry, tick_height))).unwrap();
+                    None
+                }
+            })
+            .last()
+            .unwrap()
+            .unwrap();
+
+        let mut res_entries = vec![];
+        let mut last_tick_height = 0;
+        let mut bank_slot = 0;
+        while let Ok(result) = recv_slot_entries(&r) {
+            bank_slot = result.bank.slot();
+            last_tick_height = result.last_tick_height;
+            res_entries = result.entries;
+        }
+        assert_eq!(bank_slot, bank2.slot());
+        assert_eq!(last_tick_height, expected_last_height);
+        assert_eq!(res_entries, vec![last_entry]);
+    }
 }

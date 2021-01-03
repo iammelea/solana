@@ -34,7 +34,7 @@ source lib/config.sh
 if [[ ! -f lib/grafana-provisioning ]]; then
   cp -va grafana-provisioning lib
   ./adjust-dashboard-for-channel.py \
-    lib/grafana-provisioning/dashboards/testnet-monitor.json local
+    lib/grafana-provisioning/dashboards/cluster-monitor.json local
 
   mkdir -p lib/grafana-provisioning/datasources
   cat > lib/grafana-provisioning/datasources/datasource.yml <<EOF
@@ -55,7 +55,7 @@ fi
 
 set -x
 
-: "${INFLUXDB_IMAGE:=influxdb:1.6}"
+: "${INFLUXDB_IMAGE:=influxdb:1.7}"
 : "${GRAFANA_IMAGE:=solanalabs/grafana:stable}"
 : "${GRAFANA_IMAGE:=grafana/grafana:5.2.3}"
 

@@ -3,16 +3,15 @@ set -e
 
 cd "$(dirname "$0")"/../..
 
-echo "$(date) | $0 $*" > client.log
-
 deployMethod="$1"
 entrypointIp="$2"
 clientToRun="$3"
-RUST_LOG="$4"
+if [[ -n $4 ]]; then
+  export RUST_LOG="$4"
+fi
 benchTpsExtraArgs="$5"
 benchExchangeExtraArgs="$6"
 clientIndex="$7"
-export RUST_LOG=${RUST_LOG:-solana=info} # if RUST_LOG is unset, default to info
 
 missing() {
   echo "Error: $1 not specified"
@@ -34,33 +33,23 @@ case $deployMethod in
 local|tar)
   PATH="$HOME"/.cargo/bin:"$PATH"
   export USE_INSTALL=1
-
-  ./fetch-perf-libs.sh
-  # shellcheck source=/dev/null
-  source ./target/perf-libs/env.sh
-
-  net/scripts/rsync-retry.sh -vPrc "$entrypointIp:~/.cargo/bin/solana*" ~/.cargo/bin/
+  net/scripts/rsync-retry.sh -vPrc "$entrypointIp:~/.cargo/bin/*" ~/.cargo/bin/
+  ;;
+skip)
   ;;
 *)
   echo "Unknown deployment method: $deployMethod"
   exit 1
 esac
 
-(
-  sudo scripts/oom-monitor.sh
-) > oom-monitor.log 2>&1 &
-scripts/net-stats.sh  > net-stats.log 2>&1 &
-
-! tmux list-sessions || tmux kill-session
-
 case $clientToRun in
 solana-bench-tps)
   net/scripts/rsync-retry.sh -vPrc \
-    "$entrypointIp":~/solana/solana-client-accounts/bench-tps"$clientIndex".yml ./client-accounts.yml
+    "$entrypointIp":~/solana/config/bench-tps"$clientIndex".yml ./client-accounts.yml
   clientCommand="\
     solana-bench-tps \
       --entrypoint $entrypointIp:8001 \
-      --drone $entrypointIp:9900 \
+      --faucet $entrypointIp:9900 \
       --duration 7500 \
       --sustained \
       --threads $threadCount \
@@ -69,13 +58,13 @@ solana-bench-tps)
   "
   ;;
 solana-bench-exchange)
-  solana-keygen new -f -o bench.keypair
+  solana-keygen new --no-passphrase -fso bench.keypair
   net/scripts/rsync-retry.sh -vPrc \
-    "$entrypointIp":~/solana/solana-client-accounts/bench-exchange"$clientIndex".yml ./client-accounts.yml
+    "$entrypointIp":~/solana/config/bench-exchange"$clientIndex".yml ./client-accounts.yml
   clientCommand="\
     solana-bench-exchange \
       --entrypoint $entrypointIp:8001 \
-      --drone $entrypointIp:9900 \
+      --faucet $entrypointIp:9900 \
       --threads $threadCount \
       --batch-size 1000 \
       --fund-amount 20000 \
@@ -85,10 +74,36 @@ solana-bench-exchange)
       --read-client-keys ./client-accounts.yml \
   "
   ;;
+idle)
+  # Add the faucet keypair to idle clients for convenience
+  net/scripts/rsync-retry.sh -vPrc \
+    "$entrypointIp":~/solana/config/faucet.json ~/solana/
+  exit 0
+  ;;
 *)
   echo "Unknown client name: $clientToRun"
   exit 1
 esac
+
+
+cat > ~/solana/on-reboot <<EOF
+#!/usr/bin/env bash
+cd ~/solana
+
+PATH="$HOME"/.cargo/bin:"$PATH"
+export USE_INSTALL=1
+
+echo "$(date) | $0 $*" >> client.log
+
+(
+  sudo SOLANA_METRICS_CONFIG="$SOLANA_METRICS_CONFIG" scripts/oom-monitor.sh
+) > oom-monitor.log 2>&1 &
+echo \$! > oom-monitor.pid
+scripts/fd-monitor.sh > fd-monitor.log 2>&1 &
+echo \$! > fd-monitor.pid
+scripts/net-stats.sh  > net-stats.log 2>&1 &
+echo \$! > net-stats.pid
+! tmux list-sessions || tmux kill-session
 
 tmux new -s "$clientToRun" -d "
   while true; do
@@ -99,5 +114,11 @@ tmux new -s "$clientToRun" -d "
     $metricsWriteDatapoint 'testnet-deploy client-complete=1'
   done
 "
+EOF
+chmod +x ~/solana/on-reboot
+echo "@reboot ~/solana/on-reboot" | crontab -
+
+~/solana/on-reboot
+
 sleep 1
 tmux capture-pane -t "$clientToRun" -p -S -100

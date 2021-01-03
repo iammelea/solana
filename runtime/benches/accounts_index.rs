@@ -3,26 +3,31 @@
 extern crate test;
 
 use rand::{thread_rng, Rng};
-use solana_runtime::accounts_db::AccountInfo;
-use solana_runtime::accounts_index::AccountsIndex;
-use solana_sdk::pubkey::Pubkey;
+use solana_runtime::{accounts_db::AccountInfo, accounts_index::AccountsIndex};
+use solana_sdk::pubkey::{self, Pubkey};
+use std::collections::HashSet;
 use test::Bencher;
 
 #[bench]
 fn bench_accounts_index(bencher: &mut Bencher) {
     const NUM_PUBKEYS: usize = 10_000;
-    let pubkeys: Vec<_> = (0..NUM_PUBKEYS)
-        .into_iter()
-        .map(|_| Pubkey::new_rand())
-        .collect();
+    let pubkeys: Vec<_> = (0..NUM_PUBKEYS).map(|_| pubkey::new_rand()).collect();
 
     const NUM_FORKS: u64 = 16;
 
     let mut reclaims = vec![];
-    let mut index = AccountsIndex::<AccountInfo>::default();
+    let index = AccountsIndex::<AccountInfo>::default();
     for f in 0..NUM_FORKS {
-        for _p in 0..NUM_PUBKEYS {
-            index.insert(f, &pubkeys[_p], AccountInfo::default(), &mut reclaims);
+        for pubkey in pubkeys.iter().take(NUM_PUBKEYS) {
+            index.upsert(
+                f,
+                pubkey,
+                &Pubkey::default(),
+                &[],
+                &HashSet::new(),
+                AccountInfo::default(),
+                &mut reclaims,
+            );
         }
     }
 
@@ -31,9 +36,12 @@ fn bench_accounts_index(bencher: &mut Bencher) {
     bencher.iter(|| {
         for _p in 0..NUM_PUBKEYS {
             let pubkey = thread_rng().gen_range(0, NUM_PUBKEYS);
-            index.insert(
+            index.upsert(
                 fork,
                 &pubkeys[pubkey],
+                &Pubkey::default(),
+                &[],
+                &HashSet::new(),
                 AccountInfo::default(),
                 &mut reclaims,
             );

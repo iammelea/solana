@@ -3,16 +3,21 @@
 # Run a minimal Solana cluster.  Ctrl-C to exit.
 #
 # Before running this script ensure standard Solana programs are available
-# in the PATH, or that `cargo build --all` ran successfully
+# in the PATH, or that `cargo build` ran successfully
 #
 set -e
 
-# Prefer possible `cargo build --all` binaries over PATH binaries
+# Prefer possible `cargo build` binaries over PATH binaries
 cd "$(dirname "$0")/"
-PATH=$PWD/target/debug:$PATH
+
+profile=debug
+if [[ -n $NDEBUG ]]; then
+  profile=release
+fi
+PATH=$PWD/target/$profile:$PATH
 
 ok=true
-for program in solana-{drone,genesis,keygen,validator}; do
+for program in solana-{faucet,genesis,keygen,validator}; do
   $program -V || ok=false
 done
 $ok || {
@@ -24,88 +29,85 @@ $ok || {
   exit 1
 }
 
-blockstreamSocket=/tmp/solana-blockstream.sock # Default to location used by the block explorer
-while [[ -n $1 ]]; do
-  if [[ $1 = --blockstream ]]; then
-    blockstreamSocket=$2
-    shift 2
-  else
-    echo "Unknown argument: $1"
-    exit 1
-  fi
-done
-
-export RUST_LOG=${RUST_LOG:-solana=info} # if RUST_LOG is unset, default to info
+export RUST_LOG=${RUST_LOG:-solana=info,solana_runtime::message_processor=debug} # if RUST_LOG is unset, default to info
 export RUST_BACKTRACE=1
-dataDir=$PWD/config-local/"$(basename "$0" .sh)"
+dataDir=$PWD/config/"$(basename "$0" .sh)"
 ledgerDir=$PWD/config/ledger
 
+SOLANA_RUN_SH_CLUSTER_TYPE=${SOLANA_RUN_SH_CLUSTER_TYPE:-development}
+
 set -x
-leader_keypair="$dataDir/leader-keypair.json"
-if [[ -e $leader_keypair ]]; then
-  echo "Use existing leader keypair"
-else
-  solana-keygen new -o "$leader_keypair"
+if ! solana address; then
+  echo Generating default keypair
+  solana-keygen new --no-passphrase
 fi
-leader_vote_account_keypair="$dataDir/leader-vote-account-keypair.json"
-if [[ -e $leader_vote_account_keypair ]]; then
-  echo "Use existing leader vote account keypair"
+validator_identity="$dataDir/validator-identity.json"
+if [[ -e $validator_identity ]]; then
+  echo "Use existing validator keypair"
 else
-  solana-keygen new -o "$leader_vote_account_keypair"
+  solana-keygen new --no-passphrase -so "$validator_identity"
 fi
-leader_stake_account_keypair="$dataDir/leader-stake-account-keypair.json"
-if [[ -e $leader_stake_account_keypair ]]; then
-  echo "Use existing leader stake account keypair"
+validator_vote_account="$dataDir/validator-vote-account.json"
+if [[ -e $validator_vote_account ]]; then
+  echo "Use existing validator vote account keypair"
 else
-  solana-keygen new -o "$leader_stake_account_keypair"
+  solana-keygen new --no-passphrase -so "$validator_vote_account"
 fi
-solana-keygen new -f -o "$dataDir"/drone-keypair.json
-solana-keygen new -f -o "$dataDir"/leader-storage-account-keypair.json
+validator_stake_account="$dataDir/validator-stake-account.json"
+if [[ -e $validator_stake_account ]]; then
+  echo "Use existing validator stake account keypair"
+else
+  solana-keygen new --no-passphrase -so "$validator_stake_account"
+fi
 
-leaderVoteAccountPubkey=$(\
-  solana-wallet \
-    --keypair "$dataDir"/leader-vote-account-keypair.json  \
-    address \
-)
+if [[ -e "$ledgerDir"/genesis.bin || -e "$ledgerDir"/genesis.tar.bz2 ]]; then
+  echo "Use existing genesis"
+else
+  ./fetch-spl.sh
+  if [[ -r spl-genesis-args.sh ]]; then
+    SPL_GENESIS_ARGS=$(cat spl-genesis-args.sh)
+  fi
 
-solana-genesis \
-  --lamports 1000000000 \
-  --bootstrap-leader-lamports 10000000 \
-  --target-lamports-per-signature 42 \
-  --target-signatures-per-slot 42 \
-  --hashes-per-tick sleep \
-  --mint "$dataDir"/drone-keypair.json \
-  --bootstrap-leader-keypair "$dataDir"/leader-keypair.json \
-  --bootstrap-vote-keypair "$dataDir"/leader-vote-account-keypair.json \
-  --bootstrap-stake-keypair "$dataDir"/leader-stake-account-keypair.json \
-  --bootstrap-storage-keypair "$dataDir"/leader-storage-account-keypair.json \
-  --ledger "$ledgerDir"
+  # shellcheck disable=SC2086
+  solana-genesis \
+    --hashes-per-tick sleep \
+    --faucet-lamports 500000000000000000 \
+    --bootstrap-validator \
+      "$dataDir"/validator-identity.json \
+      "$dataDir"/validator-vote-account.json \
+      "$dataDir"/validator-stake-account.json \
+    --ledger "$ledgerDir" \
+    --cluster-type "$SOLANA_RUN_SH_CLUSTER_TYPE" \
+    $SPL_GENESIS_ARGS \
+    $SOLANA_RUN_SH_GENESIS_ARGS
+fi
 
 abort() {
   set +e
-  kill "$drone" "$validator"
+  kill "$faucet" "$validator"
+  wait "$validator"
 }
 trap abort INT TERM EXIT
 
-solana-drone --keypair "$dataDir"/drone-keypair.json &
-drone=$!
+solana-faucet &
+faucet=$!
 
 args=(
-  --identity "$dataDir"/leader-keypair.json
-  --storage-keypair "$dataDir"/leader-storage-account-keypair.json
-  --voting-keypair "$dataDir"/leader-vote-account-keypair.json
-  --vote-account "$leaderVoteAccountPubkey"
+  --identity "$dataDir"/validator-identity.json
+  --vote-account "$dataDir"/validator-vote-account.json
   --ledger "$ledgerDir"
   --gossip-port 8001
   --rpc-port 8899
-  --rpc-drone-address 127.0.0.1:9900
-  --accounts "$dataDir"/accounts
-  --snapshot-path "$dataDir"/snapshots
+  --rpc-faucet-address 127.0.0.1:9900
+  --log -
+  --enable-rpc-exit
+  --enable-rpc-transaction-history
+  --init-complete-file "$dataDir"/init-completed
+  --snapshot-compression none
+  --require-tower
 )
-if [[ -n $blockstreamSocket ]]; then
-  args+=(--blockstream "$blockstreamSocket")
-fi
-solana-validator "${args[@]}" &
+# shellcheck disable=SC2086
+solana-validator "${args[@]}" $SOLANA_RUN_SH_VALIDATOR_ARGS &
 validator=$!
 
 wait "$validator"

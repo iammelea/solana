@@ -1,19 +1,15 @@
-
-# Note: This crate must be built using build.sh
-
 [package]
 name = "solana-bpf-rust-many-args-dep"
-version = "0.17.0"
-description = "Solana BPF many-args-dep program written in Rust"
-authors = ["Solana Maintainers <maintainers@solana.com>"]
+version = "1.6.0"
+description = "Solana BPF test program written in Rust"
+authors = ["Solana Maintainers <maintainers@solana.foundation>"]
 repository = "https://github.com/solana-labs/solana"
 license = "Apache-2.0"
 homepage = "https://solana.com/"
 edition = "2018"
 
 [dependencies]
-solana-sdk-bpf-utils = { path = "../../../../sdk/bpf/rust/rust-utils", version = "0.17.0" }
+solana-program = { path = "../../../../sdk/program", version = "1.6.0" }
 
-[workspace]
-members = []
-
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
